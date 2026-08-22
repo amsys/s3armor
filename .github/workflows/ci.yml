@@ -46,9 +46,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # taiki-e/install-action ships a prebuilt cargo-fuzz linked against
+      # musl, which makes cargo-fuzz default its own build target to musl
+      # (baked in via current_platform::CURRENT_PLATFORM) — incompatible with
+      # ASan's static linking and not installed on this runner. Force gnu.
       - run: |
           for target in v1_frame v1_footer; do
-            cargo fuzz run "$target" -- -runs=20000
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" -- -runs=20000
           done
         working-directory: crates/s3armor-format
       # aws-chunked decoder and SigV4 header parsers: the two untrusted-input
@@ -56,7 +60,7 @@ jobs:
       # policy" names four targets).
       - run: |
           for target in aws_chunked sigv4_parsers; do
-            cargo fuzz run "$target" -- -runs=20000
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" -- -runs=20000
           done
         working-directory: crates/s3armor
 
