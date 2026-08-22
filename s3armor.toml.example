@@ -1,0 +1,127 @@
+# s3armor.toml.example — every config.toml section, with two backends and two
+# clients, so you never have to guess which table maps to which S3A_* var.
+# See docs/USER-GUIDE.md §3.3 for the file-discovery rule (--config, then
+# ./s3armor.toml, then /etc/s3armor/config.toml) and §3.2a for multi-backend.
+#
+# Copy this file to s3armor.toml (or wherever --config points), delete what you
+# don't need, and fill in the values. Environment variables always override
+# whatever is set here — put anything that varies per-deployment (secrets,
+# endpoints) in the environment instead, and the rest here.
+#
+# Secrets never go inline in this file — s3armor refuses to start if one does,
+# and names the offending key. Every secret-bearing field below has a
+# `*_file` sibling that reads a mounted secret file instead (the same idea
+# as the environment's NAME_FILE convention, just its own TOML key). A
+# config.toml this file's shape can be shared or committed with zero
+# secrets in it.
+
+listen = "0.0.0.0:8080"
+log = "info"          # or a full tracing filter, e.g. "s3armor=debug,warn"
+log_format = "text"   # or "json"
+
+# S3A_BIND_PATHS — off by default. Do not flip this to "on"/"strict" on a
+# bucket that already has objects without reading docs/ARCHITECTURE.md
+# "Path binding" first: it changes how new writes wrap their key, and old objects need
+# `s3armor rebind` before they'd be readable under the new binding.
+bind_paths = "off"
+
+# --- backend(s) ----------------------------------------------------------
+# [backend] is the implicit backend named DEFAULT. A deployment with only
+# one backend needs nothing more than this table — everything below the
+# next comment ([backends.<name>], and every client's `backend =` line) is
+# additive, for a deployment with more than one upstream.
+
+[backend]
+endpoint = "https://fsn1.your-objectstorage.com"
+region = "fsn1"
+access_key = "..."
+# secret_key is never allowed here inline — use the environment
+# (S3A_BACKEND_SECRET_KEY or _FILE) or the line below.
+secret_key_file = "/run/secrets/backend_secret"
+
+# A second, named backend. <name> becomes its uppercased name (WASABI) —
+# case-insensitive when a client refers back to it. Add as many
+# [backends.<name>] tables as you have upstreams.
+[backends.wasabi]
+endpoint = "https://s3.eu-central-2.wasabisys.com"
+region = "eu-central-2"
+access_key = "..."
+secret_key_file = "/run/secrets/wasabi_secret"
+
+# --- timeouts --------------------------------------------------------------
+
+[timeouts]
+connect = 10   # seconds
+request = 300  # seconds; also bounds the graceful-drain window on shutdown
+
+# --- clients ---------------------------------------------------------------
+# Each [clients.<name>] table is one inbound credential pair — the access
+# key/secret your S3 client (rclone, restic, Nextcloud, ...) authenticates
+# to *this proxy* with. These are never sent upstream; the proxy always
+# re-signs with the resolved backend's own credentials.
+
+[clients.nextcloud]
+access_key = "nextcloud"
+# secret_key is never allowed here inline — same rule as the backend's.
+# secret_key_file = "/run/secrets/nc_secret"
+# No `backend =` line: this client routes to DEFAULT.
+
+[clients.offsite]
+access_key = "offsite"
+# secret_key_file = "/run/secrets/offsite_secret"
+backend = "wasabi"  # routes to [backends.wasabi] above, not DEFAULT
+
+# --- crypto ------------------------------------------------------------
+
+[crypto]
+chunk_size = 1048576  # 1 MiB; valid range 65536-8388608
+alg = "auto"          # "auto" | "aes-gcm" | "xchacha20-poly1305"
+
+# --- keys ----------------------------------------------------------------
+# Master keys for wrapping/unwrapping object data keys. Generate with
+# `s3armor keygen` — read its wallet warning before you do anything else with
+# the key it prints.
+
+[keys]
+active = "K1"
+# A bare key under [keys] is the key material itself, which is always a
+# secret — never allowed inline, same rule as everywhere else in this file.
+# Use the environment (S3A_KEY_K1 or _FILE) or a *_file entry:
+# K1_file = "/run/secrets/master_key"
+
+# --- rsa (optional) --------------------------------------------------------
+# Only needed for a write-only ingestion node, or a node that reads RSA-
+# wrapped objects. Set at most one of key/key_file (private, read+write) or
+# public/public_file (public, write-only) — never both key and public.
+
+[rsa]
+# key_file = "/run/secrets/rsa_private_key"    # read+write node
+# public = "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"  # write-only node; not a secret
+
+# --- multipart -----------------------------------------------------------
+
+[multipart]
+ttl = "24h"           # accepts "24h" / "90m" / a bare seconds count
+footer_cache = 1024   # LRU entries; raise only past 1024 concurrently-hot
+                       # multipart uploads
+
+# --- metrics (optional) -----------------------------------------------
+
+[metrics]
+# listen = "0.0.0.0:9090"  # unset (the default) turns metrics off; this is
+                            # a separate, UNAUTHENTICATED listener
+
+# --- tls (optional) --------------------------------------------------------
+# Both or neither — one alone is a fatal startup error. Unset means plain
+# HTTP (the common case behind a TLS-terminating reverse proxy).
+
+[tls]
+# cert = "/etc/s3armor/tls/cert.pem"
+# key = "/etc/s3armor/tls/key.pem"
+
+# --- auth ------------------------------------------------------------------
+
+[auth]
+fail_limit = 60  # failed SigV4 attempts per source IP per minute before
+                  # 429 SlowDown; 0 disables the limiter (do this behind a
+                  # reverse proxy, where every client collapses to one IP)

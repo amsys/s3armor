@@ -1,0 +1,92 @@
+# Pre-commit gates for s3armor. See AGENTS.md for setup.
+#
+# Fast checks run on `pre-commit` and block the commit. The slow test
+# suite and cargo-deny run on `pre-push` — a testcontainers-backed docker
+# suite has no place blocking every commit. CI runs the full matrix
+# regardless of what a contributor skipped locally.
+minimum_pre_commit_version: "3.5.0"
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
+
+# AWS SigV4 conformance vectors are compared byte-exact, some deliberately
+# without a trailing newline. Hygiene hooks must never rewrite them.
+exclude: '^crates/s3armor/testdata/aws-sig-v4-test-suite/'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: detect-private-key
+        # False positives, not real keys: test-key.pem is a test-only
+        # Ed25519 key (scripts/tls-check.sh's TLS listener check); the
+        # other two only mention the PEM header string in a doc comment or
+        # a `grep` pattern, never an actual key.
+        exclude: '^crates/s3armor/testdata/tls/test-key\.pem$|^crates/s3armor-format/src/v1/wrap\.rs$|^scripts/tooling-check\.sh$'
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.11.0
+    hooks:
+      - id: shellcheck
+        args: [--severity=style, --external-sources]
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args:
+          - feat
+          - fix
+          - refactor
+          - test
+          - docs
+          - chore
+          - perf
+          - ci
+          - build
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --locked -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-test
+        name: cargo test (unit, lib+bins only)
+        entry: cargo test --workspace --lib --bins --locked
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+      - id: cargo-deny
+        name: cargo deny check
+        entry: cargo deny check
+        language: system
+        files: '(^|/)Cargo\.(toml|lock)$|^deny\.toml$'
+        pass_filenames: false
+        stages: [pre-push]

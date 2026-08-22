@@ -1,0 +1,64 @@
+[package]
+name = "s3armor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "s3armor"
+path = "src/main.rs"
+
+[features]
+default = []
+# Developer-only CPU profiling: adds a flamegraph endpoint to the metrics
+# listener (`proxy::metrics`, `docs/ARCHITECTURE.md` "Profiling support"). Off by default, never
+# in the release image — only the `-debug` Docker target enables it.
+pprof = ["dep:pprof"]
+
+[dependencies]
+s3armor-format = { path = "../s3armor-format", version = "0.1.0" }
+rsa = "0.9"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "webpki-roots", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+quick-xml = "0.41"
+percent-encoding = "2"
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
+subtle = "2"
+thiserror = "2"
+zeroize = "1"
+dashmap = "6"
+lru = "0.18"
+httpdate = "1"
+pprof = { version = "0.15", default-features = false, features = ["flamegraph"], optional = true }
+toml = "0.8"
+
+[dev-dependencies]
+aws-sigv4 = "1.5"
+aws-sdk-s3 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-config = "1"
+testcontainers = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full", "test-util"] }

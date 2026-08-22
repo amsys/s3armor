@@ -1,0 +1,111 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071: RSA-OAEP decrypt in the `rsa` crate is not
+    # constant-time (the "Marvin Attack"). No patched release exists. RSA
+    # unwrap is used for the v1 write-only cluster's read/full nodes
+    # (docs/ARCHITECTURE.md "Keys and wrap") — a deliberate, already-made
+    # product decision, not something this workspace can route around.
+    # Upgrade path: swap to a constant-time OAEP implementation, or drop
+    # RSA support, if this crate's fix never lands.
+    "RUSTSEC-2023-0071",
+
+    # All four below are dev-dependency-only, pulled in by testing
+    # infrastructure (aws-config's own internal HTTP client for STS/SSO
+    # calls we never make; testcontainers' image-tarball extraction), and
+    # never reach the shipped binary. `cargo tree` confirms every path is
+    # `(dev) s3armor -> ...`.
+    #
+    # RUSTSEC-2026-0098/0099/0104: certificate name-constraint and CRL
+    # parsing bugs in `rustls-webpki` 0.101.7, pulled by the now-outdated
+    # `hyper-rustls` 0.24.2 -> `rustls` 0.21.12 chain inside `aws-config`'s
+    # `aws-smithy-http-client`. Our own client (`proxy/client.rs`) pins
+    # `hyper-rustls` 0.27 / `rustls-webpki` 0.103 directly — unaffected.
+    # Upgrade path: track `aws-config` picking up a newer smithy runtime.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # RUSTSEC-2025-0111: `tokio-tar` (archived, no patched release) mis-
+    # parses PAX headers in `testcontainers`' image-loading path. We only
+    # pull known-good, official images (`minio/minio`) by tag, never
+    # untrusted tarballs. Upgrade path: `testcontainers` switching to
+    # `astral-tokio-tar` or an equivalent maintained fork.
+    "RUSTSEC-2025-0111",
+    # RUSTSEC-2025-0134: `rustls-pemfile` is unmaintained (archived), pulled
+    # by `bollard` (Docker Engine API client) inside `testcontainers` — dev-
+    # only, since `crates/s3armor/src/tls.rs` was migrated to
+    # `rustls-pki-types`'s own `PemObject` API (`s3armor`'s direct dependency on
+    # `rustls-pemfile` is gone; only the dev-dependency path through
+    # `testcontainers` -> `bollard` remains). No safe upgrade exists yet
+    # upstream. Upgrade path: `bollard` moving to `PemObject` too.
+    "RUSTSEC-2025-0134",
+    # RUSTSEC-2026-0258: unbounded empty DATA frames in `h2` 0.3.27, pulled
+    # by `aws-config`'s smithy HTTP client via the old `hyper` 0.14 stack —
+    # dev-only. Our own runtime stack (`proxy/client.rs`) is on `hyper` 1.x
+    # with `h2` 0.4.16, already patched; both versions coexist in the tree.
+    "RUSTSEC-2026-0258",
+
+    # The optional, off-by-default `pprof` feature (flamegraph
+    # profiling, never in the release image) pulls `inferno` -> an old
+    # `quick-xml 0.26.0`, flagged by the same two advisories already
+    # fixed for this workspace's own direct `quick-xml` dependency
+    # (bumped to 0.41 there). Different situation here: traced inferno's
+    # actual flamegraph-rendering code path
+    # (`inferno::flamegraph::svg`/`from_lines`, what `pprof::Report::
+    # flamegraph` calls) and confirmed it only constructs `quick_xml::
+    # Writer` to emit SVG output — it never parses XML input, so it never
+    # calls `BytesStart::attributes()` or touches `NsReader`, the exact
+    # code paths both advisories name as vulnerable. Re-check this if
+    # `inferno` or `pprof` are ever upgraded and the call path changes.
+    #
+    # RUSTSEC-2026-0195: unbounded namespace-declaration allocation in
+    # `NsReader` — not used.
+    "RUSTSEC-2026-0195",
+    # Sibling advisory: O(n^2) duplicate-attribute-name scan in
+    # `BytesStart::attributes()` — not used (write-only).
+    "RUSTSEC-2026-0194",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # webpki-roots' bundled Mozilla root CA data (hyper-rustls's
+    # webpki-roots feature, a runtime dependency of proxy/client.rs).
+    "CDLA-Permissive-2.0",
+    # dunce's alternate license option (also satisfiable via Apache-2.0,
+    # already on this list, but kept explicit rather than relying on that).
+    "CC0-1.0",
+    # This workspace's own license.
+    "AGPL-3.0-or-later",
+]
+
+[[licenses.exceptions]]
+# inferno is pprof's flamegraph renderer (a port of Brendan Gregg's
+# flamegraph.pl), pulled in only by the optional, off-by-default `pprof`
+# feature (crates/s3armor/Cargo.toml). `[graph] all-features = true` above
+# means this gate scans it even though the feature is off by default and
+# never enabled in the release image — only the `-debug` Docker target
+# builds with it. Scoped to this one crate, not a blanket allow, so a
+# future dependency pulling CDDL-1.0 through a different path still fails
+# closed. Before ever publishing a `-debug` image: review the CDDL-1.0 /
+# AGPL-3.0-or-later combination first.
+name = "inferno"
+allow = ["CDDL-1.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

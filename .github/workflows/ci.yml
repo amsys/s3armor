@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo nextest run --workspace --locked
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
+      - run: |
+          for target in v1_frame v1_footer; do
+            cargo fuzz run "$target" -- -runs=20000
+          done
+        working-directory: crates/s3armor-format
+      # aws-chunked decoder and SigV4 header parsers: the two untrusted-input
+      # parsers in crates/s3armor itself (docs/ARCHITECTURE.md "Fuzz-target
+      # policy" names four targets).
+      - run: |
+          for target in aws_chunked sigv4_parsers; do
+            cargo fuzz run "$target" -- -runs=20000
+          done
+        working-directory: crates/s3armor
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t s3armor:ci .
+      - run: docker run --rm s3armor:ci --version
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # fmt/clippy already run, cached, in their own jobs above — skip them
+      # here so this job is just the hygiene/secret/shellcheck/commit-msg
+      # hooks for anyone who skipped `pre-commit install` locally.
+      - uses: pre-commit/action@v3.0.1
+        env:
+          SKIP: cargo-fmt,cargo-clippy
+
+  coverage:
+    runs-on: ubuntu-latest
+    # docs/ARCHITECTURE.md "Coverage"/"Deployment"'s "gate >= 80%" is enforced here
+    # (cargo llvm-cov nextest ... --lcov produces an artifact, and the build
+    # below fails if it drops under threshold). main.rs (the binary's own
+    # serve/handle_connection/CLI dispatch), tools/check.rs, and
+    # tools/bench.rs are excluded from the gate: all three are CLI entry
+    # points/backend probes validated by scripts/*.sh against the real
+    # binary, not by Rust tests — the same split the project already draws
+    # between integration tests (library code, crates/s3armor/tests/) and the
+    # scripts/*-check.sh scripts (binary-level behavior: TLS, signals, real
+    # backends).
+    # The rest of the workspace measured 86.78% lines when this gate was
+    # added; 80% leaves headroom without being toothless.
+    env:
+      COVERAGE_IGNORE: 's3armor/src/main\.rs|s3armor/src/tools/(check|bench)\.rs'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo llvm-cov nextest --workspace --locked --lcov
+          --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"
+      - run: >
+          cargo llvm-cov report --fail-under-lines 80
+          --ignore-filename-regex "$COVERAGE_IGNORE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
+  sonarcloud:
+    needs: coverage
+    runs-on: ubuntu-latest
+    # A fork PR has no access to secrets.SONAR_TOKEN, so it would run this
+    # job only to fail a required check the contributor cannot fix. Skip it
+    # there; it still runs on every push and every same-repo PR.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarCloud's new-code detection needs full history
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/download-artifact@v4
+        with:
+          name: lcov
+      - uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

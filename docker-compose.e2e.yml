@@ -1,0 +1,151 @@
+# docker-compose.e2e.yml — Nextcloud primary storage + Stalwart blob store
+# against the proxy: "the acceptance test for the actual product promise"
+# (docs/ARCHITECTURE.md "End-to-end smoke test"). CI-optional ("End-to-end smoke test") — run locally with
+# scripts/e2e-check.sh; nothing in .github/workflows/ci.yml runs it. Not a
+# production topology: MinIO is a single node, no TLS, throwaway secrets.
+#
+# Nextcloud's half is fully driven and verified by scripts/e2e-check.sh:
+# WebDAV upload/download/rename/delete through the proxy, plus a direct
+# read against MinIO proving the stored object is genuinely ciphertext
+# (s3a-v/s3a-dek metadata present, the uploaded marker text absent from the
+# raw bytes).
+#
+# Stalwart's half is a known, documented gap, not silently dropped: v0.16
+# has no flat-file non-interactive bootstrap this script can drive headless
+# — `--config` only accepts a minimal DataStore pointer (see stalwart's own
+# "declarative deployments" docs: "It only needs to contain the DataStore
+# object"), and the rest of its configuration (listeners, storage roles,
+# the S3 blob store pointed at this proxy) is meant to be pushed via
+# `stalwart-cli apply` against its JMAP management API, or entered once
+# through the web setup wizard at :8081 (persisted to the `stalwart-etc`
+# volume after that). Neither is scriptable from what's documented today.
+# This compose file still defines the service, with the credentials and
+# network wiring a working config would need, so completing the wizard
+# manually (`docker compose -f docker-compose.e2e.yml up stalwart`, then
+# http://localhost:18381) is a one-time step away from the mailbox
+# round-trip. scripts/e2e-check.sh confirms the container
+# starts and is reachable, then says plainly that it is not asserting the
+# round-trip, rather than faking a pass.
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/backend_secret
+    secrets: [backend_secret]
+    volumes:
+      - e2e-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+      mc alias set m http://minio:9000 minioadmin $$(cat /run/secrets/backend_secret) &&
+      mc mb -p m/nextcloud &&
+      mc mb -p m/stalwart
+      "
+    secrets: [backend_secret]
+
+  s3armor:
+    build: .
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "8080:8080" # S3 API — not needed by either client below (both
+        # reach s3armor over the compose network), published for debugging.
+    environment:
+      S3A_LISTEN: 0.0.0.0:8080
+      S3A_BACKEND_ENDPOINT: http://minio:9000
+      S3A_BACKEND_REGION: us-east-1
+      S3A_BACKEND_ACCESS_KEY: minioadmin
+      S3A_BACKEND_SECRET_KEY_FILE: /run/secrets/backend_secret
+      S3A_CLIENT_NEXTCLOUD_ACCESS_KEY: nextcloud
+      S3A_CLIENT_NEXTCLOUD_SECRET_KEY_FILE: /run/secrets/nc_secret
+      S3A_CLIENT_STALWART_ACCESS_KEY: stalwart
+      S3A_CLIENT_STALWART_SECRET_KEY_FILE: /run/secrets/sw_secret
+      S3A_KEY_ACTIVE: K1
+      S3A_KEY_K1_FILE: /run/secrets/master_key
+    secrets: [backend_secret, nc_secret, sw_secret, master_key]
+    healthcheck:
+      test: ["CMD", "/s3armor", "health-probe"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  nextcloud:
+    image: nextcloud:31-apache
+    depends_on:
+      s3armor:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    ports:
+      - "18380:80"
+    environment:
+      SQLITE_DATABASE: nextcloud
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: e2e-admin-password
+      NEXTCLOUD_TRUSTED_DOMAINS: "localhost 127.0.0.1"
+      OBJECTSTORE_S3_BUCKET: nextcloud
+      OBJECTSTORE_S3_HOST: s3armor
+      OBJECTSTORE_S3_PORT: 8080
+      OBJECTSTORE_S3_KEY: nextcloud
+      OBJECTSTORE_S3_SECRET: e2e-nextcloud-secret
+      OBJECTSTORE_S3_REGION: us-east-1
+      OBJECTSTORE_S3_SSL: "false"
+      # `s3armor`'s routing is path-style only (`crates/s3armor/src/proxy/route.rs`
+      # — no configured proxy domain to detect virtual-hosted-style
+      # against). Without this, Nextcloud sends virtual-hosted-style
+      # requests, every one lands on a bucket-less path, the proxy's
+      # classifier falls through to plain passthrough, and objects are
+      # stored **unencrypted**. This is the single most consequential
+      # setting in this file.
+      OBJECTSTORE_S3_USEPATH_STYLE: "true"
+      # The bucket is created by `createbuckets` above — Nextcloud does
+      # not need IAM permissions to create its own bucket.
+      OBJECTSTORE_S3_AUTOCREATE: "false"
+
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16
+    depends_on:
+      s3armor:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    ports:
+      - "18381:8080" # web setup wizard / management API
+      - "18382:143" # IMAP
+    volumes:
+      - e2e-stalwart-etc:/etc/stalwart
+      - e2e-stalwart-data:/var/lib/stalwart
+    environment:
+      # Fixed admin credentials instead of the log-extracted temporary
+      # password Stalwart otherwise prints on first boot. Does not skip the
+      # setup wizard by itself — see this file's header comment.
+      STALWART_RECOVERY_ADMIN: "admin:e2e-admin-password"
+
+secrets:
+  backend_secret:
+    file: ./secrets-e2e/backend_secret
+  nc_secret:
+    file: ./secrets-e2e/nc_secret
+  sw_secret:
+    file: ./secrets-e2e/sw_secret
+  master_key:
+    file: ./secrets-e2e/master_key
+
+volumes:
+  e2e-minio-data:
+  e2e-stalwart-etc:
+  e2e-stalwart-data:

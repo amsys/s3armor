@@ -1,0 +1,13 @@
+title = "s3armor gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test-only fixtures with no real secret value"
+paths = [
+  # Ed25519 test key for scripts/tls-check.sh's TLS listener check.
+  '''^crates/s3armor/testdata/tls/test-key\.pem$''',
+  # Upstream AWS SigV4 test suite: public AKIDEXAMPLE credentials, no real secret value.
+  '''^crates/s3armor/testdata/aws-sig-v4-test-suite/''',
+]

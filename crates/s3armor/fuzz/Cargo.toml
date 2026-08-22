@@ -1,0 +1,31 @@
+[package]
+name = "s3armor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.s3armor]
+path = ".."
+
+[[bin]]
+name = "aws_chunked"
+path = "fuzz_targets/aws_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigv4_parsers"
+path = "fuzz_targets/sigv4_parsers.rs"
+test = false
+doc = false
+bench = false

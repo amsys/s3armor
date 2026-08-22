@@ -1,0 +1,22 @@
+# Rust build output.
+/target/
+**/target/
+
+# Local secrets and env.
+.env
+secrets/
+secrets-e2e/
+
+
+# cargo-fuzz generated corpus and crash artifacts. Regenerable; not a
+# committed seed corpus (none committed yet — add one deliberately if/when
+# fuzzing finds a durable regression case worth pinning).
+crates/s3armor-format/fuzz/corpus/
+crates/s3armor-format/fuzz/artifacts/
+crates/s3armor-format/fuzz/target/
+crates/s3armor/fuzz/corpus/
+crates/s3armor/fuzz/artifacts/
+crates/s3armor/fuzz/target/
+
+# Coverage report generated for the SonarCloud scan; not committed.
+/lcov.info

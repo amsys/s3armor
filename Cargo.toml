@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = ["crates/s3armor-format", "crates/s3armor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/amsys/s3armor"
+
+[workspace.lints.rust]
+unsafe_code = "forbid" # workspace has zero unsafe today — keep it that way.
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_import_braces = "warn"
+future_incompatible = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Cosmetic doc/API noise. No defect value, high volume.
+must_use_candidate = "allow"
+doc_markdown = "allow"
+too_long_first_doc_paragraph = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+
+# Restriction lints: the security half of the strict policy.
+unwrap_used = "warn"
+expect_used = "warn"
+unwrap_in_result = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+integer_division = "warn"
+float_cmp = "warn"
+lossy_float_literal = "warn"
+mem_forget = "warn"
+dbg_macro = "warn"
+string_slice = "warn"
+verbose_file_reads = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+try_err = "warn"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# `perf`/flamegraphs need real stacks — see docs/ARCHITECTURE.md "Profiling support". Frame
+# pointers are a rustc codegen flag, not a Cargo profile key (there is no
+# such key to set here); the Dockerfile's debug stage sets
+# `RUSTFLAGS="-C force-frame-pointers=yes"` when building with this profile.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+lto = "thin"

@@ -1,0 +1,104 @@
+# docker-compose.yml — demo stack (MinIO backend + s3armor): every S3A_* knob
+# this quickstart needs, in one place, secrets via Docker secrets — never
+# in plaintext env or bind-mounted YAML. See docs/USER-GUIDE.md for the
+# full configuration reference, and docs/ARCHITECTURE.md "Configuration
+# model".
+#
+# Quickstart:
+#   mkdir -p secrets
+#   printf 'minioadmin-secret' > secrets/backend_secret
+#   printf 'nextcloud-secret-change-me' > secrets/nc_secret
+#   touch secrets/master_key  # placeholder — every secret in the `secrets:`
+#     # block below must exist as a file before `docker compose run` will
+#     # resolve this service at all, even just to generate the real key
+#   docker compose run --rm --entrypoint /s3armor s3armor keygen > /tmp/k
+#   # copy the base64 key line (not the S3A_KEY_ACTIVE=... line) into:
+#   # `-f2-`, not `-f2`: base64 of 32 bytes ends in `=` padding, and a bare
+#   # `-f2` truncates it, failing load_keys' "not base64 of exactly 32
+#   # bytes" check.
+#   tail -n +2 /tmp/k | head -1 | cut -d= -f2- > secrets/master_key
+#   docker compose up
+#
+# s3armor listens on :8080 (S3 API — point clients here) and :9090 (Prometheus
+# /metrics, optional — drop the port mapping if nothing scrapes it). MinIO's
+# own console is on :9001, useful for inspecting the raw ciphertext at rest.
+#
+# This file is a working demo, not a production topology: MinIO here is a
+# single node with no real durability. Point S3A_BACKEND_ENDPOINT at a real
+# backend (Hetzner Object Storage, AWS, Ceph RGW) for anything that matters.
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/backend_secret
+    ports:
+      - "9001:9001" # MinIO console — drop this in anything but a demo
+    secrets: [backend_secret]
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  s3armor:
+    build: .
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "8080:8080" # S3 API
+      # Prometheus /metrics — unauthenticated, keep this on a private
+      # interface in anything but a demo. Never publish it from a `-debug`
+      # build (README's Profiling section): that image also serves a
+      # flamegraph endpoint here, which leaks more than counters do.
+      - "9090:9090"
+    environment:
+      S3A_LISTEN: 0.0.0.0:8080
+      S3A_METRICS: 0.0.0.0:9090
+      S3A_BACKEND_ENDPOINT: http://minio:9000
+      S3A_BACKEND_REGION: us-east-1
+      S3A_BACKEND_ACCESS_KEY: minioadmin
+      S3A_BACKEND_SECRET_KEY_FILE: /run/secrets/backend_secret
+      S3A_CLIENT_NEXTCLOUD_ACCESS_KEY: nextcloud
+      S3A_CLIENT_NEXTCLOUD_SECRET_KEY_FILE: /run/secrets/nc_secret
+      # Key names are matched case-sensitively and must be [A-Z0-9]+
+      # (config.rs's `load_keys`) — S3A_KEY_ACTIVE's value and the
+      # S3A_KEY_<NAME>[_FILE] suffix must match exactly, including case.
+      S3A_KEY_ACTIVE: K1
+      S3A_KEY_K1_FILE: /run/secrets/master_key
+      #
+      # S3A_TLS_CERT/S3A_TLS_KEY (both, paths to PEM files, not shown here):
+      # terminate TLS on :8080 directly. Left off in this demo — most
+      # deployments sit behind a TLS-terminating reverse proxy instead.
+      #
+      # S3A_AUTH_FAIL_LIMIT (default 60): failed-auth attempts per source IP
+      # per minute before 429 SlowDown. Behind a reverse proxy every client
+      # collapses to one IP (no X-Forwarded-For trust) — set this to 0 there.
+      #
+      # S3A_BIND_PATHS (default off; not shown here): on|strict binds each
+      # object's DEK to its bucket+key, detecting an object-swap by an
+      # attacker with backend write access. `on` is safe on an existing
+      # bucket (unbound objects still read); `strict` needs every object
+      # rebound first (`s3armor rebind`).
+    secrets: [backend_secret, nc_secret, master_key]
+    healthcheck:
+      test: ["CMD", "/s3armor", "health-probe"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+secrets:
+  backend_secret:
+    file: ./secrets/backend_secret
+  nc_secret:
+    file: ./secrets/nc_secret
+  master_key:
+    file: ./secrets/master_key
+
+volumes:
+  minio-data:

@@ -1,0 +1,32 @@
+[package]
+name = "s3armor-format-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.s3armor-format]
+path = ".."
+
+[[bin]]
+name = "v1_frame"
+path = "fuzz_targets/v1_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v1_footer"
+path = "fuzz_targets/v1_footer.rs"
+test = false
+doc = false
+bench = false
