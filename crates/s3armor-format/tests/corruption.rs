@@ -19,7 +19,7 @@ use s3armor_format::v1::{
 const KEY: [u8; 32] = [0x11; 32];
 const CHUNK: usize = 16;
 
-fn flip(bytes: &mut [u8], i: usize) {
+const fn flip(bytes: &mut [u8], i: usize) {
     bytes[i] ^= 0x01;
 }
 
