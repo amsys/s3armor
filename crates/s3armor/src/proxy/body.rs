@@ -18,6 +18,10 @@ use http_body::Frame;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::Incoming;
+// MD5 here is the S3 Content-MD5/ETag protocol contract, not a security
+// control (see `check_md5`'s doc comment and `docs/ARCHITECTURE.md`
+// "ETag policy") — a client-supplied value that must be reproduced
+// byte-for-byte to interoperate, not a hash s3armor is free to strengthen.
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -257,6 +261,14 @@ pub fn encrypting(
 /// Checks a finished MD5 hasher against the client's `Content-MD5`, when
 /// both are present. `Ok(())` when there's nothing to check (no hasher
 /// means `expected_md5` was `None` to begin with).
+///
+/// MD5 is required here for S3 API compatibility, not for integrity: the
+/// client picks the hash (`Content-MD5`), and the same 16 bytes become the
+/// plaintext ETag returned on PUT/HEAD/GET (`docs/ARCHITECTURE.md` "ETag
+/// policy") — a stronger hash would produce an ETag no S3 client expects.
+/// Actual integrity rests on AES-256-GCM/XChaCha20-Poly1305 AEAD per chunk
+/// plus SigV4 SHA-256 on the request; the ETag itself is stored AEAD-sealed
+/// (`s3a-emd5`), so it isn't a content-guessing oracle for the operator.
 fn check_md5(hasher: Option<Md5>, expected: Option<[u8; 16]>) -> Result<(), &'static str> {
     let (Some(h), Some(expected)) = (hasher, expected) else {
         return Ok(());
