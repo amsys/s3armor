@@ -105,16 +105,14 @@ fn parse_list_xml(xml: &str) -> Result<ListPage, ToolError> {
                 }
             }
             Event::Text(t) => {
-                let decoded = t.decode().map_err(|e| ToolError::Xml(e.to_string()))?;
-                let text = quick_xml::escape::unescape(&decoded)
-                    .map_err(|e| ToolError::Xml(e.to_string()))?
-                    .into_owned();
-                match current_tag.as_slice() {
-                    b"Key" if in_contents => key = Some(text),
-                    b"IsTruncated" => is_truncated = text == "true",
-                    b"NextContinuationToken" => next_token = Some(text),
-                    _ => {}
-                }
+                assign_list_field(
+                    &current_tag,
+                    event_text(&t)?,
+                    in_contents,
+                    &mut key,
+                    &mut is_truncated,
+                    &mut next_token,
+                );
             }
             Event::End(e) => {
                 if e.name().as_ref() == b"Contents" {
@@ -132,6 +130,30 @@ fn parse_list_xml(xml: &str) -> Result<ListPage, ToolError> {
         objects,
         next_token: if is_truncated { next_token } else { None },
     })
+}
+
+/// Decodes and unescapes an XML text event's raw bytes.
+fn event_text(t: &quick_xml::events::BytesText<'_>) -> Result<String, ToolError> {
+    let decoded = t.decode().map_err(|e| ToolError::Xml(e.to_string()))?;
+    Ok(quick_xml::escape::unescape(&decoded)
+        .map_err(|e| ToolError::Xml(e.to_string()))?
+        .into_owned())
+}
+
+fn assign_list_field(
+    tag: &[u8],
+    text: String,
+    in_contents: bool,
+    key: &mut Option<String>,
+    is_truncated: &mut bool,
+    next_token: &mut Option<String>,
+) {
+    match tag {
+        b"Key" if in_contents => *key = Some(text),
+        b"IsTruncated" => *is_truncated = text == "true",
+        b"NextContinuationToken" => *next_token = Some(text),
+        _ => {}
+    }
 }
 
 #[cfg(test)]

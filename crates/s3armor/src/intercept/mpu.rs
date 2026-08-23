@@ -580,17 +580,7 @@ fn parse_complete_xml(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
                 }
             }
             Event::Text(t) => {
-                let decoded = t
-                    .decode()
-                    .map_err(|e| S3Error::bad_gateway(e.to_string()))?;
-                let text = quick_xml::escape::unescape(&decoded)
-                    .map_err(|e| S3Error::bad_gateway(e.to_string()))?
-                    .into_owned();
-                match current.as_slice() {
-                    b"PartNumber" => number = text.parse().ok(),
-                    b"ETag" => etag = Some(text),
-                    _ => {}
-                }
+                assign_part_field(&current, event_text(&t)?, &mut number, &mut etag);
             }
             Event::End(e) => {
                 if e.name().as_ref() == b"Part" {
@@ -604,6 +594,29 @@ fn parse_complete_xml(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
         }
     }
     Ok(parts)
+}
+
+/// Decodes and unescapes an XML text event's raw bytes.
+fn event_text(t: &quick_xml::events::BytesText<'_>) -> Result<String, S3Error> {
+    let decoded = t
+        .decode()
+        .map_err(|e| S3Error::bad_gateway(e.to_string()))?;
+    Ok(quick_xml::escape::unescape(&decoded)
+        .map_err(|e| S3Error::bad_gateway(e.to_string()))?
+        .into_owned())
+}
+
+fn assign_part_field(
+    tag: &[u8],
+    text: String,
+    number: &mut Option<u32>,
+    etag: &mut Option<String>,
+) {
+    match tag {
+        b"PartNumber" => *number = text.parse().ok(),
+        b"ETag" => *etag = Some(text),
+        _ => {}
+    }
 }
 
 fn xml_escape(s: &str) -> String {
