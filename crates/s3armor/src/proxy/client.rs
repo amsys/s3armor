@@ -28,7 +28,7 @@ pub fn build(connect_timeout: Duration) -> BackendClient {
     // rustls has no default crypto provider unless exactly one is compiled
     // in; installing it explicitly here means both this client and the
     // server-side `tls` module can rely on it already being set.
-    // Idempotent: ignore "already installed" from a second caller (tests).
+    // Safe to re-run: ignore "already installed" from a second caller (tests).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut http = HttpConnector::new();

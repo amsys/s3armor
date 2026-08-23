@@ -1,5 +1,5 @@
 //! Property tests: round-trip, size-math inversion, range-slice
-//! equivalence, footer round-trip, and decoder robustness against
+//! equivalence, footer round-trip, and decoder resistance to
 //! arbitrary byte mutation. See docs/ARCHITECTURE.md "Testing strategy".
 
 #![allow(

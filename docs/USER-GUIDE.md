@@ -523,7 +523,7 @@ and gets the backend's own, correct response.
 | PutObject | Full. Streaming encrypt; `aws-chunked` request bodies decoded and their chunk signatures verified. |
 | GetObject | Full. Routes to v1 or plain-passthrough handling as needed; every chunk is verified before any byte reaches the client. Range requests return proper `206` responses. |
 | HeadObject | Full. Reports the correct plaintext size. |
-| CreateMultipartUpload / UploadPart / CompleteMultipartUpload / AbortMultipartUpload | Full. Retrying `CompleteMultipartUpload` is safe (idempotent). |
+| CreateMultipartUpload / UploadPart / CompleteMultipartUpload / AbortMultipartUpload | Full. Retrying `CompleteMultipartUpload` is safe — it returns the cached response. |
 | ListParts | Full passthrough. Reported part sizes are ciphertext sizes — see [Known limits](#11-known-limits). |
 | CopyObject | Supported for most sources. |
 | UploadPartCopy | **501 Not Implemented.** Ciphertext cannot be re-chunked on the backend side. |

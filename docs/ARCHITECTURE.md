@@ -275,7 +275,7 @@ then the footer frame, then the trailer.
 - `HeadObject`, sequential `GetObject`, and ranged `GetObject` on multipart
   objects resolve sizes with one ranged read of the footer (the last 16
   bytes, then the footer itself), cached in a small LRU.
-- **Idempotent Complete.** SDKs retry `CompleteMultipartUpload`. The
+- **Complete is safe to retry.** SDKs retry `CompleteMultipartUpload`. The
   session is not deleted at Complete; it is marked completed with the
   response cached, and expires only by TTL. A retried Complete returns the
   cached response.
@@ -407,7 +407,7 @@ runs with parallel workers, a checkpoint file for resumability, and a
 | `PutObject` | intercepted: streaming encrypt; aws-chunked decoded with chunk signatures verified; plaintext-MD5 ETag when available ("ETag policy") |
 | `GetObject` | intercepted: v1 / passthrough routing; every chunk verified before release; Range → `206` + `Content-Range` under both routings |
 | `HeadObject` | intercepted: plaintext size fixup (v1 math / footer read) |
-| Create/Upload/Complete/Abort multipart | intercepted ("Multipart v1"); Complete is idempotent; part list is validated |
+| Create/Upload/Complete/Abort multipart | intercepted ("Multipart v1"); Complete is safe to retry; part list is validated |
 | `ListParts` | passthrough — the backend's own XML; part sizes are ciphertext sizes, same caveat as "List sizes are ciphertext sizes" |
 | `CopyObject` | passthrough by default for a v1 source (metadata copies with the object; ciphertext is not path-bound), plus one diagnostic `HEAD` against the source issued directly to the backend before the copy. With `BIND_PATHS` enabled, a v1 source instead goes through a thin DEK-rewrap interceptor, still one server-side copy. `metadata-directive: REPLACE` against an encrypted source is rejected, since it would drop the `s3a-*` metadata and orphan the object. |
 | `UploadPartCopy` | `501`, in v1: ciphertext cannot be re-chunked server-side |
@@ -879,7 +879,7 @@ mitigation.
 ### Multipart sessions are RAM, single instance
 
 A restart loses in-flight uploads. Clients retry; already-completed
-objects are unaffected, and Complete is idempotent within the session
+objects are unaffected, and a retried Complete is safe within the session
 TTL. Snapshotting session state to disk is a possible future option if
 LXC operators need it; nothing today builds it.
 

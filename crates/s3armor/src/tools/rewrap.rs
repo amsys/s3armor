@@ -426,7 +426,7 @@ async fn rebind_one(
 
     // Already wrapped under this (bucket, key)'s current binding (a no-op
     // re-run, or S3A_BIND_PATHS=off where "current" is the empty binding
-    // anyway) — idempotent, nothing to do.
+    // anyway) — safe to re-run, nothing to do.
     if keyring
         .unwrap(meta.kek, &meta.kid, &meta.wrapped_dek, &current_binding)
         .is_ok()
