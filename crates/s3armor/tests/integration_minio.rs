@@ -1024,6 +1024,101 @@ async fn client_disconnect_mid_put_leaves_no_object() {
     );
 }
 
+/// `x-amz-decoded-content-length` is trusted verbatim as the plaintext
+/// length for, on multipart, the persisted `PartRecord.pt_len`
+/// (`intercept::mpu::handle_upload_part`) — but was never itself checked
+/// against the real aws-chunked payload (`S3ARMOR-REVIEW.md` §1.3). This
+/// targets the small-part buffered branch specifically: unlike the
+/// streaming branch, its outbound `Content-Length` is derived from the
+/// real encrypted bytes (`ct.len()`), not the client's declared length, so
+/// no transport-level Content-Length check catches a lie here — only the
+/// explicit `plaintext.len() != pt_len` check added in `intercept::mpu`
+/// does. A declared length that disagrees with the real body must abort
+/// the part upload rather than silently recording the wrong `pt_len` (the
+/// exact case that used to desync a sealed footer's part layout from the
+/// real ciphertext, per the review). Hand-signed like
+/// `client_disconnect_mid_put_leaves_no_object` above, since the SDK always
+/// computes a correct decoded length itself.
+#[tokio::test]
+async fn upload_part_decoded_length_mismatch_is_rejected() {
+    let (client, endpoint, _minio_endpoint, _minio) = setup().await;
+    let bucket = "upload-part-length-mismatch";
+    let key = "lied-length.bin";
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create bucket");
+    let created = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("create multipart upload");
+    let upload_id = created.upload_id().expect("upload id").to_string();
+
+    let host = endpoint
+        .strip_prefix("http://")
+        .expect("proxy endpoint is http://host:port");
+    let amz_date = s3armor::sigv4::time::format_amz_date(std::time::SystemTime::now());
+    let path = format!("/{bucket}/{key}");
+    let raw_query = format!("partNumber=1&uploadId={upload_id}");
+    let payload_hash = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+    let headers = vec![
+        ("host".to_string(), host.to_string()),
+        ("x-amz-date".to_string(), amz_date.clone()),
+    ];
+    let signed_names = vec!["host".to_string(), "x-amz-date".to_string()];
+    let auth = s3armor::sigv4::sign::authorization_header(
+        "PUT",
+        &path,
+        &raw_query,
+        &headers,
+        &signed_names,
+        payload_hash,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        "us-east-1",
+        "s3",
+        &amz_date,
+    );
+
+    // A real 11-byte plaintext as a single unsigned chunk, small enough
+    // that `handle_upload_part` picks the buffered small-part branch
+    // regardless — but `x-amz-decoded-content-length` overstates it as
+    // 999. (The understating direction is separately caught by `Limited`
+    // capping the buffer at the declared length; this direction only the
+    // explicit `plaintext.len() != pt_len` check catches.)
+    let plaintext = b"hello world";
+    let mut wire = format!("{:x}\r\n", plaintext.len()).into_bytes();
+    wire.extend_from_slice(plaintext);
+    wire.extend_from_slice(b"\r\n0\r\n\r\n");
+
+    let req = http::Request::builder()
+        .method("PUT")
+        .uri(format!("{endpoint}{path}?{raw_query}"))
+        .header("x-amz-date", &amz_date)
+        .header("authorization", &auth)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("x-amz-decoded-content-length", "999")
+        .body(http_body_util::Full::new(bytes::Bytes::from(wire)))
+        .expect("build UploadPart request");
+    let http_client: hyper_util::client::legacy::Client<_, http_body_util::Full<bytes::Bytes>> =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http();
+    let resp = http_client
+        .request(req)
+        .await
+        .expect("UploadPart reaches the proxy");
+    assert!(
+        !resp.status().is_success(),
+        "a declared decoded length that disagrees with the real body must be rejected, got {}",
+        resp.status()
+    );
+}
+
 #[tokio::test]
 async fn corrupted_ciphertext_at_rest_is_rejected_on_get() {
     let (client, _endpoint, minio_endpoint, _minio) = setup().await;

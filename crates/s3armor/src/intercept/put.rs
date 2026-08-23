@@ -73,7 +73,16 @@ pub async fn handle(
     let ct_len = ciphertext_len(alg, pt_len, chunk_size as u64);
     set_header(&mut outbound_headers, "content-length", &ct_len.to_string());
 
-    let body = body::encrypting(base_body, alg, dek, chunk_size, expected_md5, 0, None);
+    let body = body::encrypting(
+        base_body,
+        alg,
+        dek,
+        chunk_size,
+        expected_md5,
+        pt_len,
+        0,
+        None,
+    );
 
     let backend_resp = forward(
         state,

@@ -26,7 +26,7 @@ use std::fmt::Write as _;
 
 use bytes::Bytes;
 use http::Response;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use rand_core::{OsRng, RngCore};
@@ -178,11 +178,23 @@ pub async fn handle_upload_part(
         // Small enough that this might turn out to be the client's final
         // part — buffer the ciphertext so Complete can merge it with the
         // footer instead of uploading a doomed-to-be-too-small extra part.
-        let plaintext = base_body
+        //
+        // `ct_len` (hence this branch) was picked from the client's own
+        // declared `pt_len`, so a client can pick this branch and then
+        // stream more than it declared — `Limited` caps how much of that
+        // ever buffers, and the length check below catches both directions
+        // of a mismatch, matching `pt_len` to the real bytes read (the
+        // streaming branch's `body::encrypting` does the same check).
+        let plaintext = Limited::new(base_body, usize::try_from(pt_len).unwrap_or(usize::MAX))
             .collect()
             .await
             .map_err(|e| S3Error::bad_gateway(format!("reading part body: {e}")))?
             .to_bytes();
+        if plaintext.len() as u64 != pt_len {
+            return Err(S3Error::bad_gateway(
+                "declared decoded length does not match the streamed body",
+            ));
+        }
         let ct = Bytes::from(encrypt_all(
             alg,
             &dek,
@@ -214,6 +226,7 @@ pub async fn handle_upload_part(
             dek,
             chunk_size as usize,
             None,
+            pt_len,
             part_number,
             None,
         );

@@ -203,18 +203,31 @@ async fn forward_chunks(
 /// aborted via the same Err-frame protocol as `hashing`/`dechunking`: the
 /// PUT never commits.
 ///
+/// `expected_pt_len` is the plaintext length the caller already promised
+/// downstream (the outbound ciphertext `Content-Length`, and for multipart
+/// the part's persisted `pt_len`) — checked against the real byte count as
+/// it streams, and again at EOF, so a client whose `x-amz-decoded-content-length`
+/// diverges from what its aws-chunked body actually contains can never
+/// desync the recorded plaintext length from the real ciphertext on the
+/// backend.
+///
 /// `trailer`, when set, is appended after the final frame — lets a caller
 /// concatenate a sealed footer onto a part's ciphertext stream without an
 /// extra buffering pass. The proxy's own multipart write path
 /// (`intercept::mpu`) never needs this: it either uploads the footer as
 /// its own part, or merges it into a buffered small tail with
 /// `body::full`. No caller in this tree currently passes `Some` here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one streaming encrypt step: alg/dek/chunk_size describe the cipher, expected_md5/expected_pt_len/trailer are independent EOF checks and appends; splitting would fragment a single auditable pipeline"
+)]
 pub fn encrypting(
     mut inner: ProxyBody,
     alg: Alg,
     dek: [u8; 32],
     chunk_size: usize,
     expected_md5: Option<[u8; 16]>,
+    expected_pt_len: u64,
     part_number: u32,
     trailer: Option<Bytes>,
 ) -> ProxyBody {
@@ -222,12 +235,22 @@ pub fn encrypting(
     tokio::spawn(async move {
         let mut enc = Encryptor::new(alg, dek, part_number, chunk_size);
         let mut hasher = expected_md5.is_some().then(Md5::new);
+        let mut seen: u64 = 0;
         loop {
             match inner.frame().await {
                 Some(Ok(frame)) => {
                     let Ok(data) = frame.into_data() else {
                         continue; // a trailers frame; ignore
                     };
+                    seen += data.len() as u64;
+                    if seen > expected_pt_len {
+                        let _ = tx
+                            .send(Err(io_err(
+                                "streamed plaintext exceeds the declared decoded length",
+                            )))
+                            .await;
+                        return;
+                    }
                     if let Some(h) = hasher.as_mut() {
                         h.update(&data);
                     }
@@ -241,7 +264,16 @@ pub fn encrypting(
                     return;
                 }
                 None => {
-                    finish_encrypting(enc, hasher, expected_md5, trailer, &tx).await;
+                    finish_encrypting(
+                        enc,
+                        hasher,
+                        expected_md5,
+                        seen,
+                        expected_pt_len,
+                        trailer,
+                        &tx,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -251,15 +283,26 @@ pub fn encrypting(
 }
 
 /// Finalises an `encrypting` stream at EOF: verifies the client's
-/// `Content-MD5` when one was given, then sends the last frame — the
+/// `Content-MD5` when one was given and that the streamed byte count
+/// matched the declared decoded length, then sends the last frame — the
 /// encryptor's tail plus `trailer`, when set.
 async fn finish_encrypting(
     enc: Encryptor,
     hasher: Option<Md5>,
     expected_md5: Option<[u8; 16]>,
+    seen: u64,
+    expected_pt_len: u64,
     trailer: Option<Bytes>,
     tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
 ) {
+    if seen != expected_pt_len {
+        let _ = tx
+            .send(Err(io_err(
+                "streamed plaintext is shorter than the declared decoded length",
+            )))
+            .await;
+        return;
+    }
     if let Err(msg) = check_md5(hasher, expected_md5) {
         let _ = tx.send(Err(io_err(msg))).await;
         return;
@@ -864,16 +907,69 @@ mod tests {
     async fn encrypting_round_trips_through_decryptor() {
         let plaintext = b"the quick brown fox jumps over the lazy dog";
         let body = full(Bytes::from_static(plaintext));
-        let ct = collect_ok(encrypting(body, Alg::Aes256Gcm, KEY, CHUNK, None, 0, None)).await;
+        let ct = collect_ok(encrypting(
+            body,
+            Alg::Aes256Gcm,
+            KEY,
+            CHUNK,
+            None,
+            plaintext.len() as u64,
+            0,
+            None,
+        ))
+        .await;
         let pt = decrypt_all(Alg::Aes256Gcm, &KEY, 0, CHUNK, &ct).expect("decrypts");
         assert_eq!(pt, plaintext);
+    }
+
+    #[tokio::test]
+    async fn encrypting_rejects_a_body_longer_than_the_declared_length() {
+        let plaintext = b"the quick brown fox jumps over the lazy dog";
+        let body = full(Bytes::from_static(plaintext));
+        // A claimed decoded length shorter than the real body — the client's
+        // `x-amz-decoded-content-length` understating what its aws-chunked
+        // stream actually contains.
+        let res = encrypting(
+            body,
+            Alg::Aes256Gcm,
+            KEY,
+            CHUNK,
+            None,
+            plaintext.len() as u64 - 1,
+            0,
+            None,
+        )
+        .collect()
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypting_rejects_a_body_shorter_than_the_declared_length() {
+        let plaintext = b"the quick brown fox jumps over the lazy dog";
+        let body = full(Bytes::from_static(plaintext));
+        // A claimed decoded length longer than the real body — the reverse
+        // direction of the same declared-vs-real-bytes mismatch.
+        let res = encrypting(
+            body,
+            Alg::Aes256Gcm,
+            KEY,
+            CHUNK,
+            None,
+            plaintext.len() as u64 + 1,
+            0,
+            None,
+        )
+        .collect()
+        .await;
+        assert!(res.is_err());
     }
 
     #[tokio::test]
     async fn encrypting_rejects_a_content_md5_mismatch() {
         let body = full(Bytes::from_static(b"payload"));
         let wrong = [0u8; 16];
-        let res = encrypting(body, Alg::Aes256Gcm, KEY, CHUNK, Some(wrong), 0, None)
+        let res = encrypting(body, Alg::Aes256Gcm, KEY, CHUNK, Some(wrong), 7, 0, None)
             .collect()
             .await;
         assert!(res.is_err());
@@ -890,6 +986,7 @@ mod tests {
             KEY,
             CHUNK,
             Some(expected),
+            plaintext.len() as u64,
             0,
             None,
         ))
@@ -914,6 +1011,7 @@ mod tests {
             KEY,
             CHUNK,
             None,
+            plaintext.len() as u64,
             0,
             Some(trailer.clone()),
         ))
