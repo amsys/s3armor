@@ -108,98 +108,33 @@ fn scalar(v: &toml::Value) -> Result<String, ConfigError> {
 fn flatten(root: &toml::Table) -> Result<BTreeMap<String, String>, ConfigError> {
     let mut out = BTreeMap::new();
 
-    macro_rules! leaf {
-        ($table:expr, $key:literal, $env_name:expr) => {
-            if let Some(v) = $table.get($key) {
-                out.insert($env_name.to_string(), scalar(v)?);
-            }
-        };
+    if let Some(v) = root.get("listen") {
+        out.insert("S3A_LISTEN".to_string(), scalar(v)?);
+    }
+    if let Some(v) = root.get("log") {
+        out.insert("S3A_LOG".to_string(), scalar(v)?);
+    }
+    if let Some(v) = root.get("log_format") {
+        out.insert("S3A_LOG_FORMAT".to_string(), scalar(v)?);
+    }
+    if let Some(v) = root.get("bind_paths") {
+        out.insert("S3A_BIND_PATHS".to_string(), scalar(v)?);
     }
 
-    leaf!(root, "listen", "S3A_LISTEN");
-    leaf!(root, "log", "S3A_LOG");
-    leaf!(root, "log_format", "S3A_LOG_FORMAT");
-    leaf!(root, "bind_paths", "S3A_BIND_PATHS");
-
-    if let Some(toml::Value::Table(t)) = root.get("backend") {
-        leaf!(t, "endpoint", "S3A_BACKEND_ENDPOINT");
-        leaf!(t, "region", "S3A_BACKEND_REGION");
-        leaf!(t, "access_key", "S3A_BACKEND_ACCESS_KEY");
-        leaf!(t, "secret_key", "S3A_BACKEND_SECRET_KEY");
-        leaf!(t, "secret_key_file", "S3A_BACKEND_SECRET_KEY_FILE");
-    }
+    flatten_simple_tables(root, &mut out)?;
 
     // Named backends beyond the implicit `[backend]` (`DEFAULT`) — same
     // per-entry shape, `S3A_BACKEND_<NAME>_*` instead of `S3A_BACKEND_*`.
-    // Its own function (mirroring `[clients.<name>]` below) rather than
-    // another `leaf!` block inline here, so `flatten` itself stays under
-    // clippy's line-count lint.
     if let Some(toml::Value::Table(backends)) = root.get("backends") {
         flatten_named_backends(backends, &mut out)?;
     }
 
-    if let Some(toml::Value::Table(t)) = root.get("timeouts") {
-        leaf!(t, "connect", "S3A_TIMEOUT_CONNECT");
-        leaf!(t, "request", "S3A_TIMEOUT_REQUEST");
-    }
-
     if let Some(toml::Value::Table(clients)) = root.get("clients") {
-        for (name, v) in clients {
-            let toml::Value::Table(t) = v else { continue };
-            let upper = name.to_uppercase();
-            if let Some(v) = t.get("access_key") {
-                out.insert(format!("S3A_CLIENT_{upper}_ACCESS_KEY"), scalar(v)?);
-            }
-            if let Some(v) = t.get("secret_key") {
-                out.insert(format!("S3A_CLIENT_{upper}_SECRET_KEY"), scalar(v)?);
-            }
-            if let Some(v) = t.get("secret_key_file") {
-                out.insert(format!("S3A_CLIENT_{upper}_SECRET_KEY_FILE"), scalar(v)?);
-            }
-            if let Some(v) = t.get("backend") {
-                out.insert(format!("S3A_CLIENT_{upper}_BACKEND"), scalar(v)?);
-            }
-        }
-    }
-
-    if let Some(toml::Value::Table(t)) = root.get("crypto") {
-        leaf!(t, "chunk_size", "S3A_CHUNK_SIZE");
-        leaf!(t, "alg", "S3A_ALG");
+        flatten_clients(clients, &mut out)?;
     }
 
     if let Some(toml::Value::Table(t)) = root.get("keys") {
-        leaf!(t, "active", "S3A_KEY_ACTIVE");
-        for (name, v) in t {
-            if name == "active" || matches!(v, toml::Value::Table(_)) {
-                continue;
-            }
-            out.insert(format!("S3A_KEY_{}", name.to_uppercase()), scalar(v)?);
-        }
-    }
-
-    if let Some(toml::Value::Table(t)) = root.get("rsa") {
-        leaf!(t, "key", "S3A_RSA_KEY");
-        leaf!(t, "key_file", "S3A_RSA_KEY_FILE");
-        leaf!(t, "public", "S3A_RSA_PUBLIC");
-        leaf!(t, "public_file", "S3A_RSA_PUBLIC_FILE");
-    }
-
-    if let Some(toml::Value::Table(t)) = root.get("multipart") {
-        leaf!(t, "ttl", "S3A_MP_TTL");
-        leaf!(t, "footer_cache", "S3A_FOOTER_CACHE");
-    }
-
-    if let Some(toml::Value::Table(t)) = root.get("metrics") {
-        leaf!(t, "listen", "S3A_METRICS");
-    }
-
-    if let Some(toml::Value::Table(t)) = root.get("tls") {
-        leaf!(t, "cert", "S3A_TLS_CERT");
-        leaf!(t, "key", "S3A_TLS_KEY");
-    }
-
-    if let Some(toml::Value::Table(t)) = root.get("auth") {
-        leaf!(t, "fail_limit", "S3A_AUTH_FAIL_LIMIT");
+        flatten_keys(t, &mut out)?;
     }
 
     // Secrets are rejected inline, no exceptions — the environment or a
@@ -209,6 +144,110 @@ fn flatten(root: &toml::Table) -> Result<BTreeMap<String, String>, ConfigError> 
     }
 
     Ok(out)
+}
+
+/// `(toml table name, [(toml key, env var name), ...])` — every settings
+/// group whose keys need no name transform beyond a fixed env name (see
+/// `flatten`'s doc comment for why this is a literal table, not a
+/// mechanical dotted-path rule). `[clients]`, `[backends]`, and `[keys]`
+/// aren't here: their env names are keyed by a table-name the operator
+/// picks, not fixed per table.
+const TABLES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "backend",
+        &[
+            ("endpoint", "S3A_BACKEND_ENDPOINT"),
+            ("region", "S3A_BACKEND_REGION"),
+            ("access_key", "S3A_BACKEND_ACCESS_KEY"),
+            ("secret_key", "S3A_BACKEND_SECRET_KEY"),
+            ("secret_key_file", "S3A_BACKEND_SECRET_KEY_FILE"),
+        ],
+    ),
+    (
+        "timeouts",
+        &[
+            ("connect", "S3A_TIMEOUT_CONNECT"),
+            ("request", "S3A_TIMEOUT_REQUEST"),
+        ],
+    ),
+    (
+        "crypto",
+        &[("chunk_size", "S3A_CHUNK_SIZE"), ("alg", "S3A_ALG")],
+    ),
+    (
+        "rsa",
+        &[
+            ("key", "S3A_RSA_KEY"),
+            ("key_file", "S3A_RSA_KEY_FILE"),
+            ("public", "S3A_RSA_PUBLIC"),
+            ("public_file", "S3A_RSA_PUBLIC_FILE"),
+        ],
+    ),
+    (
+        "multipart",
+        &[("ttl", "S3A_MP_TTL"), ("footer_cache", "S3A_FOOTER_CACHE")],
+    ),
+    ("metrics", &[("listen", "S3A_METRICS")]),
+    ("tls", &[("cert", "S3A_TLS_CERT"), ("key", "S3A_TLS_KEY")]),
+    ("auth", &[("fail_limit", "S3A_AUTH_FAIL_LIMIT")]),
+];
+
+fn flatten_simple_tables(
+    root: &toml::Table,
+    out: &mut BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (table_name, keys) in TABLES {
+        let Some(toml::Value::Table(t)) = root.get(*table_name) else {
+            continue;
+        };
+        for (key, env_name) in *keys {
+            if let Some(v) = t.get(*key) {
+                out.insert((*env_name).to_string(), scalar(v)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One `[clients.<name>]` table per client, flattened to
+/// `S3A_CLIENT_<NAME>_*` — mirrors `flatten_named_backends` below.
+fn flatten_clients(
+    clients: &toml::Table,
+    out: &mut BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (name, v) in clients {
+        let toml::Value::Table(t) = v else { continue };
+        let upper = name.to_uppercase();
+        if let Some(v) = t.get("access_key") {
+            out.insert(format!("S3A_CLIENT_{upper}_ACCESS_KEY"), scalar(v)?);
+        }
+        if let Some(v) = t.get("secret_key") {
+            out.insert(format!("S3A_CLIENT_{upper}_SECRET_KEY"), scalar(v)?);
+        }
+        if let Some(v) = t.get("secret_key_file") {
+            out.insert(format!("S3A_CLIENT_{upper}_SECRET_KEY_FILE"), scalar(v)?);
+        }
+        if let Some(v) = t.get("backend") {
+            out.insert(format!("S3A_CLIENT_{upper}_BACKEND"), scalar(v)?);
+        }
+    }
+    Ok(())
+}
+
+/// `[keys]`: `active` is a plain leaf, every other scalar entry names a
+/// key (`S3A_KEY_<NAME>`); a nested table under `[keys]` is skipped rather
+/// than misread as a key value.
+fn flatten_keys(t: &toml::Table, out: &mut BTreeMap<String, String>) -> Result<(), ConfigError> {
+    if let Some(v) = t.get("active") {
+        out.insert("S3A_KEY_ACTIVE".to_string(), scalar(v)?);
+    }
+    for (name, v) in t {
+        if name == "active" || matches!(v, toml::Value::Table(_)) {
+            continue;
+        }
+        out.insert(format!("S3A_KEY_{}", name.to_uppercase()), scalar(v)?);
+    }
+    Ok(())
 }
 
 /// One `[backends.<name>]` table per named backend, flattened to
