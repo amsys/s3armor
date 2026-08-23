@@ -398,12 +398,7 @@ impl Config {
         )?;
 
         let clients = load_clients(env, &mut sources)?;
-        if let Some((client_name, bad_backend)) = clients.iter().find_map(|(n, c)| {
-            (!backends.contains_key(&c.backend)).then(|| (n.clone(), c.backend.clone()))
-        }) {
-            let known = backends.keys().cloned().collect::<Vec<_>>().join(", ");
-            return Err(ConfigError::UnknownBackend(client_name, bad_backend, known));
-        }
+        validate_client_backends(&clients, &backends)?;
 
         let chunk_size_raw = optional(
             env,
@@ -469,32 +464,7 @@ impl Config {
             None
         };
 
-        // Plain paths, not `read_var`'s NAME/NAME_FILE convention — see the
-        // field doc comment on `Config::tls`. Both set or neither: a lone
-        // cert or key is a startup config error, not a guess.
-        let tls_cert = env.get("S3A_TLS_CERT");
-        let tls_key = env.get("S3A_TLS_KEY");
-        let tls = match (tls_cert, tls_key) {
-            (Some(cert_path), Some(key_path)) => {
-                sources.insert("S3A_TLS_CERT".to_string(), Source::Env);
-                sources.insert("S3A_TLS_KEY".to_string(), Source::Env);
-                Some(TlsConfig {
-                    cert_path,
-                    key_path,
-                })
-            }
-            (None, None) => {
-                sources.insert("S3A_TLS_CERT".to_string(), Source::Default);
-                sources.insert("S3A_TLS_KEY".to_string(), Source::Default);
-                None
-            }
-            (Some(_), None) => {
-                return Err(ConfigError::Missing("S3A_TLS_KEY"));
-            }
-            (None, Some(_)) => {
-                return Err(ConfigError::Missing("S3A_TLS_CERT"));
-            }
-        };
+        let tls = parse_tls(env, &mut sources)?;
 
         let auth_fail_limit_raw = optional(env, &mut sources, "S3A_AUTH_FAIL_LIMIT", "60")?;
         let auth_fail_limit: u32 = auth_fail_limit_raw.parse().map_err(|_| {
@@ -608,42 +578,55 @@ impl Config {
                 BindMode::On => "on".to_string(),
                 BindMode::Strict => "strict".to_string(),
             },
-            other => {
-                if let Some(client_name) = other
-                    .strip_prefix("S3A_CLIENT_")
-                    .and_then(|s| s.strip_suffix("_ACCESS_KEY"))
-                {
-                    if let Some(c) = self.clients.get(client_name) {
-                        return c.access_key.clone();
-                    }
-                }
-                if let Some(client_name) = other
-                    .strip_prefix("S3A_CLIENT_")
-                    .and_then(|s| s.strip_suffix("_BACKEND"))
-                {
-                    if let Some(c) = self.clients.get(client_name) {
-                        return c.backend.clone();
-                    }
-                }
-                if let Some(rest) = other.strip_prefix("S3A_BACKEND_") {
-                    for field in ["ENDPOINT", "REGION", "ACCESS_KEY"] {
-                        let backend_name = if rest == field {
-                            Some(DEFAULT_BACKEND_NAME)
-                        } else {
-                            rest.strip_suffix(&format!("_{field}"))
-                        };
-                        if let Some(b) = backend_name.and_then(|n| self.backends.get(n)) {
-                            return match field {
-                                "ENDPOINT" => b.endpoint.clone(),
-                                "REGION" => b.region.clone(),
-                                _ => b.access_key.clone(),
-                            };
-                        }
-                    }
-                }
-                String::new()
+            other => self
+                .client_var(other)
+                .or_else(|| self.backend_var(other))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Resolves a dynamic `S3A_CLIENT_<NAME>_{ACCESS_KEY,BACKEND}` var
+    /// against a currently-discovered client name.
+    fn client_var(&self, name: &str) -> Option<String> {
+        if let Some(client_name) = name
+            .strip_prefix("S3A_CLIENT_")
+            .and_then(|s| s.strip_suffix("_ACCESS_KEY"))
+        {
+            if let Some(c) = self.clients.get(client_name) {
+                return Some(c.access_key.clone());
             }
         }
+        if let Some(client_name) = name
+            .strip_prefix("S3A_CLIENT_")
+            .and_then(|s| s.strip_suffix("_BACKEND"))
+        {
+            if let Some(c) = self.clients.get(client_name) {
+                return Some(c.backend.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolves a dynamic `S3A_BACKEND_{FIELD}` (the `DEFAULT` backend) or
+    /// `S3A_BACKEND_<NAME>_{FIELD}` var against a currently-discovered
+    /// backend name.
+    fn backend_var(&self, name: &str) -> Option<String> {
+        let rest = name.strip_prefix("S3A_BACKEND_")?;
+        for field in ["ENDPOINT", "REGION", "ACCESS_KEY"] {
+            let backend_name = if rest == field {
+                Some(DEFAULT_BACKEND_NAME)
+            } else {
+                rest.strip_suffix(&format!("_{field}"))
+            };
+            if let Some(b) = backend_name.and_then(|n| self.backends.get(n)) {
+                return Some(match field {
+                    "ENDPOINT" => b.endpoint.clone(),
+                    "REGION" => b.region.clone(),
+                    _ => b.access_key.clone(),
+                });
+            }
+        }
+        None
     }
 }
 
@@ -673,6 +656,90 @@ fn parse_duration(raw: &str, name: &'static str) -> Result<Duration, ConfigError
     Ok(Duration::from_secs(n * mul))
 }
 
+/// Plain paths, not `read_var`'s NAME/NAME_FILE convention — see the field
+/// doc comment on `Config::tls`. Both set or neither: a lone cert or key is
+/// a startup config error, not a guess.
+fn parse_tls(
+    env: &dyn EnvSource,
+    sources: &mut BTreeMap<String, Source>,
+) -> Result<Option<TlsConfig>, ConfigError> {
+    let tls_cert = env.get("S3A_TLS_CERT");
+    let tls_key = env.get("S3A_TLS_KEY");
+    match (tls_cert, tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            sources.insert("S3A_TLS_CERT".to_string(), Source::Env);
+            sources.insert("S3A_TLS_KEY".to_string(), Source::Env);
+            Ok(Some(TlsConfig {
+                cert_path,
+                key_path,
+            }))
+        }
+        (None, None) => {
+            sources.insert("S3A_TLS_CERT".to_string(), Source::Default);
+            sources.insert("S3A_TLS_KEY".to_string(), Source::Default);
+            Ok(None)
+        }
+        (Some(_), None) => Err(ConfigError::Missing("S3A_TLS_KEY")),
+        (None, Some(_)) => Err(ConfigError::Missing("S3A_TLS_CERT")),
+    }
+}
+
+/// Every client must name a backend that was actually discovered —
+/// otherwise a typo in `S3A_CLIENT_<NAME>_BACKEND` would silently fall
+/// through to whatever `BTreeMap::get` does with a missing key at request
+/// time instead of failing at startup.
+fn validate_client_backends(
+    clients: &BTreeMap<String, ClientCredentials>,
+    backends: &BTreeMap<String, Backend>,
+) -> Result<(), ConfigError> {
+    if let Some((client_name, bad_backend)) = clients.iter().find_map(|(n, c)| {
+        (!backends.contains_key(&c.backend)).then(|| (n.clone(), c.backend.clone()))
+    }) {
+        let known = backends.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(ConfigError::UnknownBackend(client_name, bad_backend, known));
+    }
+    Ok(())
+}
+
+/// Scans `env.names()` for `<prefix><NAME><suffix>`, an optional trailing
+/// `_FILE` stripped before matching, and returns the set of `<NAME>`s
+/// found. `<NAME>` is `[A-Z0-9]+` — no underscores, so the flat form parses
+/// unambiguously (see "Configuration model"). `exclude` is checked against
+/// the prefix/`_FILE`-stripped remainder before the suffix split, so an
+/// unprefixed var that's itself one of `exclude` (`load_backends`'
+/// `DEFAULT_SUFFIXES`) is never misread as `<NAME>_SUFFIX`.
+fn discover_names(
+    env: &dyn EnvSource,
+    prefix: &str,
+    suffixes: &[&str],
+    exclude: &[&str],
+) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for var in env.names() {
+        let Some(rest) = var.strip_prefix(prefix) else {
+            continue;
+        };
+        let rest = rest.strip_suffix("_FILE").unwrap_or(rest);
+        if exclude.contains(&rest) {
+            continue;
+        }
+        for suffix in suffixes {
+            if let Some(name) = rest.strip_suffix(suffix) {
+                if is_valid_name(name) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn is_valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
 /// Discovers `S3A_CLIENT_<NAME>_ACCESS_KEY(_FILE)` /
 /// `S3A_CLIENT_<NAME>_SECRET_KEY(_FILE)` pairs. `<NAME>` is `[A-Z0-9]+` —
 /// no underscores in names, so the flat form parses unambiguously (see "Configuration model").
@@ -680,27 +747,7 @@ fn load_clients(
     env: &dyn EnvSource,
     sources: &mut BTreeMap<String, Source>,
 ) -> Result<BTreeMap<String, ClientCredentials>, ConfigError> {
-    let mut names = std::collections::BTreeSet::new();
-    for var in env.names() {
-        if let Some(rest) = var.strip_prefix("S3A_CLIENT_") {
-            for suffix in [
-                "_ACCESS_KEY",
-                "_ACCESS_KEY_FILE",
-                "_SECRET_KEY",
-                "_SECRET_KEY_FILE",
-            ] {
-                if let Some(name) = rest.strip_suffix(suffix) {
-                    if !name.is_empty()
-                        && name
-                            .chars()
-                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-                    {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-        }
-    }
+    let names = discover_names(env, "S3A_CLIENT_", &["_ACCESS_KEY", "_SECRET_KEY"], &[]);
 
     let mut clients = BTreeMap::new();
     for name in names {
@@ -749,27 +796,12 @@ fn load_backends(
 ) -> Result<BTreeMap<String, Backend>, ConfigError> {
     const DEFAULT_SUFFIXES: [&str; 4] = ["ENDPOINT", "REGION", "ACCESS_KEY", "SECRET_KEY"];
 
-    let mut named = std::collections::BTreeSet::new();
-    for var in env.names() {
-        let Some(rest) = var.strip_prefix("S3A_BACKEND_") else {
-            continue;
-        };
-        let rest = rest.strip_suffix("_FILE").unwrap_or(rest);
-        if DEFAULT_SUFFIXES.contains(&rest) {
-            continue;
-        }
-        for suffix in ["_ENDPOINT", "_REGION", "_ACCESS_KEY", "_SECRET_KEY"] {
-            if let Some(name) = rest.strip_suffix(suffix) {
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-                {
-                    named.insert(name.to_string());
-                }
-            }
-        }
-    }
+    let named = discover_names(
+        env,
+        "S3A_BACKEND_",
+        &["_ENDPOINT", "_REGION", "_ACCESS_KEY", "_SECRET_KEY"],
+        &DEFAULT_SUFFIXES,
+    );
 
     let mut backends = BTreeMap::new();
 
@@ -1069,6 +1101,47 @@ mod tests {
         let env = FakeEnv::new(&pairs);
         let cfg = Config::load(&env).unwrap();
         assert_eq!(cfg.clients["NEXTCLOUD"].backend, DEFAULT_BACKEND_NAME);
+    }
+
+    #[test]
+    fn raw_value_resolves_a_dynamic_client_var() {
+        let mut pairs = minimal();
+        pairs.push(("S3A_CLIENT_NEXTCLOUD_ACCESS_KEY", "nc"));
+        pairs.push(("S3A_CLIENT_NEXTCLOUD_SECRET_KEY", "ncsecret"));
+        let env = FakeEnv::new(&pairs);
+        let cfg = Config::load(&env).unwrap();
+        assert_eq!(cfg.raw_value("S3A_CLIENT_NEXTCLOUD_ACCESS_KEY"), "nc");
+        assert_eq!(
+            cfg.raw_value("S3A_CLIENT_NEXTCLOUD_BACKEND"),
+            DEFAULT_BACKEND_NAME
+        );
+        assert_eq!(cfg.raw_value("S3A_CLIENT_UNKNOWN_ACCESS_KEY"), "");
+    }
+
+    #[test]
+    fn raw_value_resolves_a_dynamic_backend_var() {
+        let mut pairs = minimal();
+        pairs.push(("S3A_BACKEND_NEXTCLOUD_ENDPOINT", "http://nc:9000"));
+        pairs.push(("S3A_BACKEND_NEXTCLOUD_REGION", "us-east-1"));
+        pairs.push(("S3A_BACKEND_NEXTCLOUD_ACCESS_KEY", "ncaccess"));
+        pairs.push(("S3A_BACKEND_NEXTCLOUD_SECRET_KEY", "ncsecret"));
+        let env = FakeEnv::new(&pairs);
+        let cfg = Config::load(&env).unwrap();
+        assert_eq!(
+            cfg.raw_value("S3A_BACKEND_NEXTCLOUD_ENDPOINT"),
+            "http://nc:9000"
+        );
+        assert_eq!(cfg.raw_value("S3A_BACKEND_NEXTCLOUD_REGION"), "us-east-1");
+        assert_eq!(
+            cfg.raw_value("S3A_BACKEND_NEXTCLOUD_ACCESS_KEY"),
+            "ncaccess"
+        );
+        // the DEFAULT backend still resolves alongside a named one
+        assert_eq!(
+            cfg.raw_value("S3A_BACKEND_ENDPOINT"),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(cfg.raw_value("S3A_UNKNOWN_VAR"), "");
     }
 
     #[test]
