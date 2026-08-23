@@ -87,17 +87,17 @@ fn header_owned(pairs: &[(String, String)], name: &str) -> Option<String> {
 /// key before returning, success or failure.
 pub async fn check(state: &ProxyState, backend: &Backend, bucket: &str) -> CheckReport {
     let prefix = format!("s3a-check-{:x}", probe_nonce());
-    let mut probes = Vec::new();
-
-    probes.push(tls_probe(state, backend));
-    probes.push(reachable_and_auth_probe(state, backend, bucket).await);
-    probes.push(round_trip_probe(state, backend, bucket, &prefix).await);
-    probes.push(metadata_survives_probe(state, backend, bucket, &prefix).await);
-    probes.push(metadata_headroom_probe(state, backend, bucket, &prefix).await);
-    probes.push(ranged_get_probe(state, backend, bucket, &prefix).await);
-    probes.push(copy_preserves_metadata_probe(state, backend, bucket, &prefix).await);
-    probes.push(checksum_header_probe(state, backend, bucket, &prefix).await);
-    probes.push(multipart_small_final_part_probe(state, backend, bucket, &prefix).await);
+    let probes = vec![
+        tls_probe(state, backend),
+        reachable_and_auth_probe(state, backend, bucket).await,
+        round_trip_probe(state, backend, bucket, &prefix).await,
+        metadata_survives_probe(state, backend, bucket, &prefix).await,
+        metadata_headroom_probe(state, backend, bucket, &prefix).await,
+        ranged_get_probe(state, backend, bucket, &prefix).await,
+        copy_preserves_metadata_probe(state, backend, bucket, &prefix).await,
+        checksum_header_probe(state, backend, bucket, &prefix).await,
+        multipart_small_final_part_probe(state, backend, bucket, &prefix).await,
+    ];
 
     CheckReport { probes }
 }
