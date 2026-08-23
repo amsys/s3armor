@@ -18,14 +18,14 @@ image and one set of subcommands. There is no separate binary per tool.
 ### 1.1 Docker
 
 ```sh
-docker pull ghcr.io/<you>/s3armor:0.1
+docker pull ghcr.io/amsys/s3armor:0.1
 ```
 
 The image entrypoint is `s3armor`. The default command is `serve`. Run any
 other subcommand by naming it:
 
 ```sh
-docker run --rm ghcr.io/<you>/s3armor:0.1 check --bucket my-bucket
+docker run --rm ghcr.io/amsys/s3armor:0.1 check --bucket my-bucket
 ```
 
 A `-debug` build tag adds a profiling endpoint (see
@@ -34,8 +34,9 @@ production.
 
 ### 1.2 Proxmox LXC / bare systemd
 
-The same static binary runs with no container runtime. Put the binary on
-the LXC, add one env file, and add a small systemd unit:
+The same static binary runs with no container runtime. Build it with
+`cargo build --release` (produces `target/release/s3armor`), put it on the
+LXC, add one env file, and add a small systemd unit:
 
 ```ini
 # /etc/systemd/system/s3armor.service
@@ -43,9 +44,16 @@ the LXC, add one env file, and add a small systemd unit:
 DynamicUser=yes
 EnvironmentFile=/etc/s3armor/env
 LoadCredential=master_key:/etc/s3armor/master.key
+Environment=S3A_KEY_ACTIVE=K1
+Environment=S3A_KEY_K1_FILE=%d/master_key
 ExecStart=/usr/local/bin/s3armor serve
 Restart=on-failure
 ```
+
+`LoadCredential` alone only stages the key file under
+`$CREDENTIALS_DIRECTORY` (`%d`) — the two `Environment=` lines are what
+point `s3armor` at it; a unit with `LoadCredential` but no matching
+`S3A_KEY_<NAME>_FILE` fails at startup with no key material configured.
 
 Give the env file mode `0600`. It holds secrets, same as a Docker secret
 mount, just in one file instead of one file per secret.
@@ -123,7 +131,7 @@ credentials from step 2.
 ```yaml
 services:
   s3armor:
-    image: ghcr.io/<you>/s3armor:0.1
+    image: ghcr.io/amsys/s3armor:0.1
     ports: ["8080:8080"]
     environment:
       S3A_BACKEND_ENDPOINT: https://fsn1.your-objectstorage.com
@@ -159,10 +167,18 @@ checks:
   (see below), otherwise `200`.
 - `GET /ready` — readiness. Confirms the backend is reachable.
 
-On `SIGTERM` or `SIGINT`, the proxy stops accepting new connections,
-finishes in-flight requests, and exits. The drain window is bounded by
-`S3A_TIMEOUT_REQUEST` (default 300 seconds) — give your orchestrator at
-least that much time before it sends `SIGKILL`.
+For containers without a shell, `s3armor health-probe` dials `/health`
+itself and exits `0`/`1` accordingly — this is what the Docker image's
+`HEALTHCHECK` runs. It reads `S3A_LISTEN` for the target port.
+
+On `SIGTERM` or `SIGINT`, the proxy starts draining: `/health` starts
+returning `503`, and the proxy finishes in-flight requests and exits. It
+deliberately keeps *accepting* new connections during the drain — an
+accept loop that stopped the instant the signal fired would make that
+`503` unobservable, since every new probe connection would be refused
+instead of answered. The drain window is bounded by `S3A_TIMEOUT_REQUEST`
+(default 300 seconds) — give your orchestrator at least that much time
+before it sends `SIGKILL`.
 
 ## 3. Configuration reference
 
@@ -557,12 +573,33 @@ final part are accepted, ranged GET works, CopyObject preserves user
 metadata, and checksum trailers behave as expected. It prints a verdict:
 compatible, degraded (naming what breaks), or incompatible.
 
+**Exit code reflects only `incompatible`.** `compatible` and `degraded`
+both exit `0` — a `degraded` backend still works, just with a named
+caveat, so it does not fail the command. Only `incompatible` exits `1`.
+A script gating a deploy on `s3armor check && deploy` passes through a
+`degraded` warning; read the printed verdict, not just the exit code, if
+that distinction matters to you.
+
 **`s3armor check` writes and deletes real objects in the bucket you point
 it at.** Every probe object it creates is deleted before the command
 exits, but it is still live traffic against a live bucket. Never point
 `s3armor check` at a production bucket you care about — use a scratch
 bucket, or run it against a new backend before any real data lands
 there.
+
+## 10a. Tuning with `s3armor bench`
+
+`s3armor bench` measures local crypto and backend throughput on the host
+CPU, and recommends a `S3A_ALG`/`S3A_CHUNK_SIZE` block for it:
+
+```sh
+s3armor bench --write-config
+```
+
+Paste the printed block into your environment or `config.toml`. Run it
+once per deployment target — a low-power ARM NAS and a modern amd64 box
+pick different AES-GCM-vs-XChaCha20 tradeoffs, which is why `S3A_ALG`
+defaults to `auto` rather than a fixed choice.
 
 ## 11. Known limits
 

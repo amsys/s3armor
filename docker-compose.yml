@@ -8,15 +8,8 @@
 #   mkdir -p secrets
 #   printf 'minioadmin-secret' > secrets/backend_secret
 #   printf 'nextcloud-secret-change-me' > secrets/nc_secret
-#   touch secrets/master_key  # placeholder — every secret in the `secrets:`
-#     # block below must exist as a file before `docker compose run` will
-#     # resolve this service at all, even just to generate the real key
-#   docker compose run --rm --entrypoint /s3armor s3armor keygen > /tmp/k
-#   # copy the base64 key line (not the S3A_KEY_ACTIVE=... line) into:
-#   # `-f2-`, not `-f2`: base64 of 32 bytes ends in `=` padding, and a bare
-#   # `-f2` truncates it, failing load_keys' "not base64 of exactly 32
-#   # bytes" check.
-#   tail -n +2 /tmp/k | head -1 | cut -d= -f2- > secrets/master_key
+#   openssl rand -base64 32 > secrets/master_key  # back this up — see
+#     # README.md "The wallet warning"
 #   docker compose up
 #
 # s3armor listens on :8080 (S3 API — point clients here) and :9090 (Prometheus

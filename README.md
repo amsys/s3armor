@@ -45,6 +45,16 @@ operator holds ciphertext and nothing else.
   encrypt but never decrypt.
 - **TLS, metrics, rate limiting** — built in, no reverse proxy required.
 
+## Install
+
+```sh
+# Container image
+docker pull ghcr.io/amsys/s3armor:0.1
+
+# ...or build from source
+cargo build --release
+```
+
 ## Quickstart
 
 ```sh
@@ -55,15 +65,21 @@ openssl rand -base64 32
 
 # 2. Point it at a backend.
 export S3A_BACKEND_ENDPOINT=https://fsn1.your-objectstorage.com
+export S3A_BACKEND_REGION=fsn1
 export S3A_BACKEND_ACCESS_KEY=...
 export S3A_BACKEND_SECRET_KEY=...
 export S3A_KEY_ACTIVE=K1
 export S3A_KEY_K1=<the base64 line openssl printed>
 
-# 3. Preflight the backend before pointing production traffic at it.
+# 3. Give at least one client an inbound credential — with none configured
+#    every request is rejected.
+export S3A_CLIENT_APP_ACCESS_KEY=app
+export S3A_CLIENT_APP_SECRET_KEY=some-secret-you-pick
+
+# 4. Preflight the backend before pointing production traffic at it.
 s3armor check --bucket my-bucket
 
-# 4. Run.
+# 5. Run.
 s3armor serve
 ```
 

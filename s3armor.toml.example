@@ -79,8 +79,8 @@ alg = "auto"          # "auto" | "aes-gcm" | "xchacha20-poly1305"
 
 # --- keys ----------------------------------------------------------------
 # Master keys for wrapping/unwrapping object data keys. Generate with
-# `s3armor keygen` — read its wallet warning before you do anything else with
-# the key it prints.
+# `openssl rand -base64 32` — back it up before you use it anywhere; there
+# is no recovery path if it's lost (see README.md "The wallet warning").
 
 [keys]
 active = "K1"
