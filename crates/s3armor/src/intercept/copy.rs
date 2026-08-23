@@ -78,7 +78,7 @@ pub async fn handle(
         return Ok(translate_response(backend_resp, request_id));
     }
     let head_headers = to_pairs(head_resp.headers());
-    let routing = route_from_headers(&head_headers);
+    let routing = route_from_headers(&head_headers)?;
 
     let is_replace = header_value(&outbound_headers, "x-amz-metadata-directive")
         .is_some_and(|v| v.eq_ignore_ascii_case("REPLACE"));

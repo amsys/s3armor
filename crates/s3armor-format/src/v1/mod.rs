@@ -15,7 +15,7 @@ pub use frame::{
 };
 pub use meta::{
     open_emd5, seal_emd5, Kek, ObjectMeta, KEY_ALG, KEY_CHUNK, KEY_DEK, KEY_EMD5, KEY_KEK, KEY_KID,
-    KEY_MP, KEY_VERSION,
+    KEY_MP, KEY_VERSION, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
 };
 pub use multipart::{part_layout, plan_multipart_range, PartSpan};
 pub use wrap::{path_binding, MasterKey, RsaKek};

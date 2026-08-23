@@ -102,7 +102,12 @@ async fn check_preconditions(
         return Ok(None);
     }
     let resp_headers = to_pairs(head_resp.headers());
-    let routing = route_from_headers(&resp_headers);
+    // A parse failure here is the same "not this diagnostic probe's job"
+    // case as a failed HEAD above: let the real GET's own `route_from_headers`
+    // call surface the error.
+    let Ok(routing) = route_from_headers(&resp_headers) else {
+        return Ok(None);
+    };
     let Some(etag) = effective_etag(state, &routing, &resp_headers, raw_path) else {
         return Ok(None);
     };
@@ -140,7 +145,7 @@ async fn handle_full(
     }
     let resp_headers = to_pairs(backend_resp.headers());
 
-    match route_from_headers(&resp_headers) {
+    match route_from_headers(&resp_headers)? {
         Routing::V1(meta) if meta.multipart => {
             let alg = meta.alg;
             let chunk_size = meta.chunk_size as usize;
@@ -246,7 +251,7 @@ async fn handle_ranged(
     }
     let head_headers_pairs = to_pairs(head_resp.headers());
 
-    match route_from_headers(&head_headers_pairs) {
+    match route_from_headers(&head_headers_pairs)? {
         Routing::Passthrough => {
             let backend_resp = forward(
                 state,

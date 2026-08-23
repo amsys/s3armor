@@ -40,7 +40,7 @@ pub async fn handle(
         return Ok(translate_response(backend_resp, request_id));
     }
     let resp_headers = to_pairs(backend_resp.headers());
-    let routing = route_from_headers(&resp_headers);
+    let routing = route_from_headers(&resp_headers)?;
 
     if !conds.is_empty() {
         if let Some(etag) = effective_etag(state, &routing, &resp_headers, raw_path) {

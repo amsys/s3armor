@@ -14,6 +14,13 @@ pub const KEY_CHUNK: &str = "s3a-chunk";
 pub const KEY_MP: &str = "s3a-mp";
 pub const KEY_EMD5: &str = "s3a-emd5";
 
+/// `s3a-chunk` / `S3A_CHUNK_SIZE` bounds, docs/ARCHITECTURE.md "Data:
+/// chunked AEAD": 64 KiB .. 8 MiB. Shared by `from_map` (an object's stored
+/// chunk size must fall in this range, same as a freshly configured one) and
+/// `s3armor::config` (the write-side check on `S3A_CHUNK_SIZE`).
+pub const MIN_CHUNK_SIZE: u32 = 65_536;
+pub const MAX_CHUNK_SIZE: u32 = 8_388_608;
+
 /// v1 key-encryption-key kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kek {
@@ -130,7 +137,9 @@ impl ObjectMeta {
         let chunk_str = get(m, KEY_CHUNK)?;
         let chunk_size: u32 = chunk_str
             .parse()
-            .map_err(|_| invalid(KEY_CHUNK, chunk_str))?;
+            .ok()
+            .filter(|n| (MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(n))
+            .ok_or_else(|| invalid(KEY_CHUNK, chunk_str))?;
         let multipart = m.get(KEY_MP).is_some_and(|s| s == "1");
         let emd5 = match m.get(KEY_EMD5) {
             Some(s) => Some(B64.decode(s).map_err(|_| invalid(KEY_EMD5, s))?),
@@ -145,5 +154,82 @@ impl ObjectMeta {
             multipart,
             emd5,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> ObjectMeta {
+        ObjectMeta {
+            alg: Alg::Aes256Gcm,
+            kek: Kek::Aes,
+            kid: "0123456789abcdef".to_string(),
+            wrapped_dek: vec![1, 2, 3, 4],
+            chunk_size: 1_048_576,
+            multipart: false,
+            emd5: None,
+        }
+    }
+
+    #[test]
+    fn meta_round_trips() {
+        let meta = sample();
+        assert_eq!(ObjectMeta::from_map(&meta.to_map()).unwrap(), meta);
+    }
+
+    #[test]
+    fn meta_round_trips_with_multipart_and_emd5() {
+        let meta = ObjectMeta {
+            multipart: true,
+            emd5: Some(vec![9; 16]),
+            ..sample()
+        };
+        assert_eq!(ObjectMeta::from_map(&meta.to_map()).unwrap(), meta);
+    }
+
+    #[test]
+    fn chunk_size_zero_is_rejected() {
+        let mut m = sample().to_map();
+        m.insert(KEY_CHUNK.into(), "0".into());
+        let err = ObjectMeta::from_map(&m).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidMetadata {
+                key: KEY_CHUNK,
+                value: "0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn chunk_size_below_min_is_rejected() {
+        let mut m = sample().to_map();
+        m.insert(KEY_CHUNK.into(), (MIN_CHUNK_SIZE - 1).to_string());
+        assert!(ObjectMeta::from_map(&m).is_err());
+    }
+
+    #[test]
+    fn chunk_size_above_max_is_rejected() {
+        let mut m = sample().to_map();
+        m.insert(KEY_CHUNK.into(), u32::MAX.to_string());
+        let err = ObjectMeta::from_map(&m).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidMetadata {
+                key: KEY_CHUNK,
+                value: u32::MAX.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn chunk_size_at_bounds_is_accepted() {
+        let mut m = sample().to_map();
+        m.insert(KEY_CHUNK.into(), MIN_CHUNK_SIZE.to_string());
+        assert!(ObjectMeta::from_map(&m).is_ok());
+        m.insert(KEY_CHUNK.into(), MAX_CHUNK_SIZE.to_string());
+        assert!(ObjectMeta::from_map(&m).is_ok());
     }
 }

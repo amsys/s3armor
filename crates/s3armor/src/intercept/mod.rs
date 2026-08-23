@@ -34,7 +34,14 @@ pub(crate) enum Routing {
 /// Collects `x-amz-meta-*` response headers (the `x-amz-meta-` prefix
 /// stripped) and routes on **presence of the v1 version key**, never a
 /// hardcoded default.
-pub(crate) fn route_from_headers(headers: &[(String, String)]) -> Routing {
+///
+/// A present-but-unparseable v1 metadata set is a hard error, not
+/// passthrough: an object tagged `s3a-v: 1` is ciphertext, and streaming it
+/// back unmodified because its metadata failed to parse would hand the
+/// client raw ciphertext as if it were plaintext.
+pub(crate) fn route_from_headers(
+    headers: &[(String, String)],
+) -> Result<Routing, s3armor_format::Error> {
     let mut meta = BTreeMap::new();
     for (k, v) in headers {
         if let Some(rest) = k.to_ascii_lowercase().strip_prefix("x-amz-meta-") {
@@ -42,9 +49,9 @@ pub(crate) fn route_from_headers(headers: &[(String, String)]) -> Routing {
         }
     }
     if meta.contains_key(s3armor_format::v1::KEY_VERSION) {
-        return ObjectMeta::from_map(&meta).map_or(Routing::Passthrough, Routing::V1);
+        return Ok(Routing::V1(ObjectMeta::from_map(&meta)?));
     }
-    Routing::Passthrough
+    Ok(Routing::Passthrough)
 }
 
 /// `bucket ‖ key` for `S3A_BIND_PATHS` (`docs/ARCHITECTURE.md` "Path

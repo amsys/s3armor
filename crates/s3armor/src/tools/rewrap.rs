@@ -187,7 +187,7 @@ async fn rewrap_one(
         )));
     }
     let head_headers = to_pairs(head.headers());
-    let meta = match route_from_headers(&head_headers) {
+    let meta = match route_from_headers(&head_headers)? {
         Routing::V1(m) => m,
         Routing::Passthrough => return Ok(Outcome::NotV1),
     };
@@ -416,7 +416,7 @@ async fn rebind_one(
         )));
     }
     let head_headers = to_pairs(head.headers());
-    let meta = match route_from_headers(&head_headers) {
+    let meta = match route_from_headers(&head_headers)? {
         Routing::V1(m) => m,
         Routing::Passthrough => return Ok(RebindOutcome::NotV1),
     };

@@ -12,7 +12,7 @@ use std::fmt;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use s3armor_format::v1::{Alg, MasterKey, RsaKek};
+use s3armor_format::v1::{Alg, MasterKey, RsaKek, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 
 use crate::keys::{Keyring, RSA_ACTIVE_NAME};
 
@@ -301,10 +301,9 @@ pub enum LogFormat {
 
 const SECRET_KEYS: &[&str] = &["S3A_RSA_KEY"];
 
-/// `S3A_CHUNK_SIZE` bounds, docs/ARCHITECTURE.md "Data: chunked AEAD": 64
-/// KiB .. 8 MiB.
-const MIN_CHUNK_SIZE: u32 = 65_536;
-const MAX_CHUNK_SIZE: u32 = 8_388_608;
+/// `S3A_CHUNK_SIZE` bounds live in `s3armor_format::v1` (`MIN_CHUNK_SIZE`,
+/// `MAX_CHUNK_SIZE`) — shared with `ObjectMeta::from_map`'s read-side check,
+/// docs/ARCHITECTURE.md "Data: chunked AEAD": 64 KiB .. 8 MiB.
 const DEFAULT_CHUNK_SIZE: u32 = 1_048_576;
 
 fn is_secret(name: &str) -> bool {
