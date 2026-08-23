@@ -434,6 +434,11 @@ async fn serve(config_path: Option<&str>) {
                         continue;
                     }
                 };
+                // Small-request-heavy traffic (HeadObject, Nextcloud sync,
+                // presign checks) feels Nagle + delayed-ACK directly as
+                // fixed per-request latency; a socket option failure here
+                // is not a reason to drop an otherwise-good connection.
+                let _ = stream.set_nodelay(true);
                 // Held for the task's whole lifetime so `Arc::strong_count(&in_flight)`
                 // reflects exactly the connections still live — its `Drop`
                 // at task end is the side effect `drained` above polls for,

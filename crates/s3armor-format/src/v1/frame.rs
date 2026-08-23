@@ -259,19 +259,26 @@ impl Encryptor {
     /// Feed plaintext bytes. Returns any full, non-final frames now ready
     /// to write out. One full chunk is always held back, because it might
     /// turn out to be the last one.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the loop guard checks buf.len() > chunk_size, so ..chunk_size is always in bounds"
+    )]
     pub fn push(&mut self, data: &[u8]) -> Vec<u8> {
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
         while self.buf.len() > self.chunk_size {
-            let chunk: Vec<u8> = self.buf.drain(..self.chunk_size).collect();
+            // Seal directly off the buffer instead of draining a scratch
+            // `Vec` first — `seal_frame` only borrows, so there is no
+            // ownership reason to copy the whole chunk before it does.
             out.extend(seal_frame(
                 self.alg,
                 &self.key,
                 self.part_number,
                 self.chunk_index,
                 false,
-                &chunk,
+                &self.buf[..self.chunk_size],
             ));
+            self.buf.drain(..self.chunk_size);
             self.chunk_index += 1;
         }
         out
@@ -344,20 +351,28 @@ impl Decryptor {
     /// Feed ciphertext bytes. Returns the plaintext of any full, verified,
     /// non-final frames. Errs closed: an authentication failure returns an
     /// error and releases nothing from the failing frame.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the loop guard checks buf.len() > frame_size, so ..frame_size is always in bounds"
+    )]
     pub fn push(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         self.buf.extend_from_slice(data);
         let frame_size = self.chunk_size + self.alg.overhead();
         let mut out = Vec::new();
         while self.buf.len() > frame_size {
-            let frame: Vec<u8> = self.buf.drain(..frame_size).collect();
+            // Open directly off the buffer instead of draining a scratch
+            // `Vec` first (same reasoning as `Encryptor::push`). The `?`
+            // must come before the `drain`: on an auth failure the buffer
+            // is left untouched rather than partly advanced.
             let pt = open_frame(
                 self.alg,
                 &self.key,
                 self.part_number,
                 self.chunk_index,
                 false,
-                &frame,
+                &self.buf[..frame_size],
             )?;
+            self.buf.drain(..frame_size);
             out.extend(pt);
             self.chunk_index += 1;
         }

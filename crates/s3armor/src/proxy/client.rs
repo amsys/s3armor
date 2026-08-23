@@ -34,6 +34,10 @@ pub fn build(connect_timeout: Duration) -> BackendClient {
     let mut http = HttpConnector::new();
     http.set_connect_timeout(Some(connect_timeout));
     http.enforce_http(false); // the https:// scheme is layered on top below
+                              // This backend leg is small-request-heavy (HeadObject, presign checks);
+                              // Nagle plus delayed-ACK can park a short write for tens of ms with no
+                              // upside on a link that isn't bandwidth-bound at these sizes.
+    http.set_nodelay(true);
 
     let https = HttpsConnectorBuilder::new()
         .with_webpki_roots()
