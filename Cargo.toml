@@ -58,7 +58,7 @@ strip = true
 
 # `perf`/flamegraphs need real stacks — see docs/ARCHITECTURE.md "Profiling support". Frame
 # pointers are a rustc codegen flag, not a Cargo profile key (there is no
-# such key to set here); the Dockerfile's debug stage sets
+# such key to set here); the Containerfile's debug stage sets
 # `RUSTFLAGS="-C force-frame-pointers=yes"` when building with this profile.
 [profile.profiling]
 inherits = "release"

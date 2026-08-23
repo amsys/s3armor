@@ -575,7 +575,7 @@ s3armor/
 │       │   └── config.rs     # flat env loader
 │       ├── fuzz/              # SigV4 header parser, aws-chunked decoder targets
 │       └── tests/            # integration (testcontainers/MinIO)
-├── Dockerfile
+├── Containerfile
 ├── docker-compose.yml         # demo: MinIO + s3armor; doubles as a config reference
 ├── docker-compose.e2e.yml     # + Nextcloud + Stalwart smoke (local-only, see
 │                              # "End-to-end smoke test")
@@ -710,7 +710,7 @@ Profiling is built in, not bolted on:
   and uses thin LTO, so `perf` and flamegraphs get real stack traces.
   Frame-pointer generation is a rustc codegen flag
   (`-C force-frame-pointers=yes`), set through `RUSTFLAGS` in the
-  Dockerfile's debug build stage — there is no equivalent Cargo profile
+  Containerfile's debug build stage — there is no equivalent Cargo profile
   key for it. The release image ships stripped; a separate `-debug` image
   tag ships with symbols.
 - `tracing` spans wrap every pipeline stage — verify, dechunk, encrypt,

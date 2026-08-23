@@ -57,7 +57,9 @@ services:
     secrets: [backend_secret]
 
   s3armor:
-    build: .
+    build:
+      context: .
+      dockerfile: Containerfile
     depends_on:
       minio:
         condition: service_healthy

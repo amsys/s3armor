@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t s3armor:ci .
+      - run: docker build -f Containerfile -t s3armor:ci .
       - run: docker run --rm s3armor:ci --version
 
   pre-commit:

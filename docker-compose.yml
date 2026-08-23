@@ -46,7 +46,9 @@ services:
       retries: 12
 
   s3armor:
-    build: .
+    build:
+      context: .
+      dockerfile: Containerfile
     depends_on:
       minio:
         condition: service_healthy
