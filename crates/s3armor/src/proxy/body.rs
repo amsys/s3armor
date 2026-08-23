@@ -102,23 +102,8 @@ where
     tokio::spawn(async move {
         let mut dechunker = Dechunker::new();
         loop {
-            let raw = match inner.frame().await {
-                Some(Ok(frame)) => match frame.into_data() {
-                    Ok(data) => data,
-                    Err(_) => continue, // a trailers frame on the raw wire body; ignore
-                },
-                Some(Err(e)) => {
-                    let _ = tx.send(Err(io_err(e))).await;
-                    return;
-                }
-                None => {
-                    if !dechunker.is_done() {
-                        let _ = tx
-                            .send(Err(io_err("aws-chunked body ended before its terminator")))
-                            .await;
-                    }
-                    return;
-                }
+            let Some(raw) = next_raw_frame(&mut inner, &tx, &dechunker).await else {
+                return;
             };
             let chunks = match dechunker.feed(&raw) {
                 Ok(c) => c,
@@ -127,23 +112,75 @@ where
                     return;
                 }
             };
-            for (data, signature) in chunks {
-                if let (Some(v), Some(sig)) = (verifier.as_mut(), signature.as_deref()) {
-                    if let Err(e) = v.verify_and_advance(&data, sig) {
-                        let _ = tx.send(Err(io_err(chunk_error_message(&e)))).await;
-                        return;
-                    }
-                }
-                if data.is_empty() {
-                    continue; // the terminating zero-length chunk carries no bytes to forward
-                }
-                if tx.send(Ok(Frame::data(Bytes::from(data)))).await.is_err() {
-                    return;
-                }
+            if !forward_chunks(chunks, &mut verifier, &tx).await {
+                return;
             }
         }
     });
     StreamBody::new(ReceiverStream(rx)).boxed()
+}
+
+/// Pulls the next raw wire-format frame from `inner`, skipping trailers
+/// frames. Sends an `Err` frame and returns `None` on a transport error or
+/// on EOF before `dechunker` has seen the aws-chunked terminator; `None` on
+/// a clean, already-terminated EOF stops the caller with nothing more to
+/// send.
+async fn next_raw_frame<B>(
+    inner: &mut B,
+    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    dechunker: &Dechunker,
+) -> Option<Bytes>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    loop {
+        match inner.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    return Some(data);
+                }
+                // else: a trailers frame on the raw wire body; ignore, loop for the next one
+            }
+            Some(Err(e)) => {
+                let _ = tx.send(Err(io_err(e))).await;
+                return None;
+            }
+            None => {
+                if !dechunker.is_done() {
+                    let _ = tx
+                        .send(Err(io_err("aws-chunked body ended before its terminator")))
+                        .await;
+                }
+                return None;
+            }
+        }
+    }
+}
+
+/// Verifies (when `verifier` is `Some`) and forwards each decoded chunk.
+/// Returns `false` to stop the caller — either the receiver is gone, or a
+/// chunk failed verification (its `Err` frame has already been sent).
+async fn forward_chunks(
+    chunks: Vec<crate::chunked::DecodedChunk>,
+    verifier: &mut Option<ChunkVerifier>,
+    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+) -> bool {
+    for (data, signature) in chunks {
+        if let (Some(v), Some(sig)) = (verifier.as_mut(), signature.as_deref()) {
+            if let Err(e) = v.verify_and_advance(&data, sig) {
+                let _ = tx.send(Err(io_err(chunk_error_message(&e)))).await;
+                return false;
+            }
+        }
+        if data.is_empty() {
+            continue; // the terminating zero-length chunk carries no bytes to forward
+        }
+        if tx.send(Ok(Frame::data(Bytes::from(data)))).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Encrypts a plaintext request body into v1 ciphertext frames while
@@ -200,16 +237,9 @@ pub fn encrypting(
                     return;
                 }
                 None => {
-                    if let (Some(h), Some(expected)) = (hasher, expected_md5) {
-                        let got: [u8; 16] = h.finalize().into();
-                        if got != expected {
-                            let _ = tx
-                                .send(Err(io_err(
-                                    "Content-MD5 does not match the streamed plaintext",
-                                )))
-                                .await;
-                            return;
-                        }
+                    if let Err(msg) = check_md5(hasher, expected_md5) {
+                        let _ = tx.send(Err(io_err(msg))).await;
+                        return;
                     }
                     let mut out = enc.finish();
                     if let Some(t) = &trailer {
@@ -222,6 +252,21 @@ pub fn encrypting(
         }
     });
     StreamBody::new(ReceiverStream(rx)).boxed()
+}
+
+/// Checks a finished MD5 hasher against the client's `Content-MD5`, when
+/// both are present. `Ok(())` when there's nothing to check (no hasher
+/// means `expected_md5` was `None` to begin with).
+fn check_md5(hasher: Option<Md5>, expected: Option<[u8; 16]>) -> Result<(), &'static str> {
+    let (Some(h), Some(expected)) = (hasher, expected) else {
+        return Ok(());
+    };
+    let got: [u8; 16] = h.finalize().into();
+    if got == expected {
+        Ok(())
+    } else {
+        Err("Content-MD5 does not match the streamed plaintext")
+    }
 }
 
 /// Decrypts a full-object v1 ciphertext response stream, O(chunk) memory —
@@ -383,10 +428,6 @@ pub fn decrypting_range(
 /// span's ciphertext is consumed — the footer and trailer bytes that follow
 /// in the backend's response are never decrypted or forwarded. O(chunk)
 /// memory, same Err-frame abort protocol as `decrypting`.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "take = min(data.len(), remaining) as usize is bounded by data.len(), an already-usize value"
-)]
 pub fn decrypting_multipart<B>(
     mut inner: B,
     alg: Alg,
@@ -414,52 +455,29 @@ where
                         continue;
                     };
                     while !data.is_empty() {
-                        let remaining = span.ct_len - consumed_ct;
-                        let take = (data.len() as u64).min(remaining) as usize;
-                        let piece = data.split_to(take);
-                        consumed_ct += take as u64;
-                        match dec.push(&piece) {
-                            Ok(pt) => {
-                                if !pt.is_empty()
-                                    && tx.send(Ok(Frame::data(Bytes::from(pt)))).await.is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                note_chunk_verify_failure(on_verify_failure.as_ref());
-                                let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
-                                return;
-                            }
+                        let piece = take_for_span(&mut data, &span, consumed_ct);
+                        consumed_ct += piece.len() as u64;
+                        if !emit_decrypt_result(dec.push(&piece), &tx, on_verify_failure.as_ref())
+                            .await
+                        {
+                            return;
                         }
                         if consumed_ct < span.ct_len {
                             continue;
                         }
-                        match dec.finish() {
-                            Ok(pt) => {
-                                if !pt.is_empty()
-                                    && tx.send(Ok(Frame::data(Bytes::from(pt)))).await.is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                note_chunk_verify_failure(on_verify_failure.as_ref());
-                                let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
-                                return;
-                            }
+                        if !emit_decrypt_result(dec.finish(), &tx, on_verify_failure.as_ref()).await
+                        {
+                            return;
                         }
-                        match spans.next() {
-                            Some(next) => {
-                                span = next;
-                                consumed_ct = 0;
-                                dec = Decryptor::new(alg, dek, span.number, chunk_size);
-                            }
-                            // Every part decrypted — whatever remains in
-                            // `data` (or arrives in a later frame) is the
-                            // footer and trailer. Stop here.
-                            None => return,
-                        }
+                        // Every part decrypted — whatever remains in
+                        // `data` (or arrives in a later frame) is the
+                        // footer and trailer. Stop here.
+                        let Some(next) = spans.next() else {
+                            return;
+                        };
+                        span = next;
+                        consumed_ct = 0;
+                        dec = Decryptor::new(alg, dek, span.number, chunk_size);
                     }
                 }
                 Some(Err(e)) => {
@@ -480,6 +498,37 @@ where
         }
     });
     StreamBody::new(ReceiverStream(rx)).boxed()
+}
+
+/// Splits off the front of `data` for the current span, bounded by how much
+/// of that span's ciphertext is still unconsumed — the piece a single
+/// `Decryptor::push` should see next.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "take = min(data.len(), remaining) as usize is bounded by data.len(), an already-usize value"
+)]
+fn take_for_span(data: &mut Bytes, span: &PartSpan, consumed_ct: u64) -> Bytes {
+    let remaining = span.ct_len - consumed_ct;
+    let take = (data.len() as u64).min(remaining) as usize;
+    data.split_to(take)
+}
+
+/// Sends a `Decryptor::push`/`finish` result on: forwards non-empty
+/// plaintext, or reports a verify failure and ends the stream with an `Err`
+/// frame. Returns `false` to stop the caller.
+async fn emit_decrypt_result(
+    result: s3armor_format::Result<Vec<u8>>,
+    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    on_verify_failure: Option<&Arc<AtomicU64>>,
+) -> bool {
+    match result {
+        Ok(pt) => pt.is_empty() || tx.send(Ok(Frame::data(Bytes::from(pt)))).await.is_ok(),
+        Err(e) => {
+            note_chunk_verify_failure(on_verify_failure);
+            let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
+            false
+        }
+    }
 }
 
 /// Decrypts a ciphertext byte range spanning one or more parts of a
