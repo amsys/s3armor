@@ -1,6 +1,6 @@
-<p align="center">
+<div align="center">
   <img src="assets/s3armor.png" alt="s3armor" width="180">
-</p>
+</div>
 
 <h1 align="center">s3armor</h1>
 
