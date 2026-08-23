@@ -241,21 +241,34 @@ pub fn encrypting(
                     return;
                 }
                 None => {
-                    if let Err(msg) = check_md5(hasher, expected_md5) {
-                        let _ = tx.send(Err(io_err(msg))).await;
-                        return;
-                    }
-                    let mut out = enc.finish();
-                    if let Some(t) = &trailer {
-                        out.extend_from_slice(t);
-                    }
-                    let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
+                    finish_encrypting(enc, hasher, expected_md5, trailer, &tx).await;
                     return;
                 }
             }
         }
     });
     StreamBody::new(ReceiverStream(rx)).boxed()
+}
+
+/// Finalises an `encrypting` stream at EOF: verifies the client's
+/// `Content-MD5` when one was given, then sends the last frame — the
+/// encryptor's tail plus `trailer`, when set.
+async fn finish_encrypting(
+    enc: Encryptor,
+    hasher: Option<Md5>,
+    expected_md5: Option<[u8; 16]>,
+    trailer: Option<Bytes>,
+    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+) {
+    if let Err(msg) = check_md5(hasher, expected_md5) {
+        let _ = tx.send(Err(io_err(msg))).await;
+        return;
+    }
+    let mut out = enc.finish();
+    if let Some(t) = &trailer {
+        out.extend_from_slice(t);
+    }
+    let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
 }
 
 /// Checks a finished MD5 hasher against the client's `Content-MD5`, when
@@ -454,42 +467,17 @@ where
 {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
     tokio::spawn(async move {
-        let mut spans = spans.into_iter();
-        let Some(mut span) = spans.next() else {
+        let Some(mut cursor) = MultipartCursor::new(alg, dek, chunk_size, spans) else {
             return; // an empty multipart object (no parts) — nothing to decrypt
         };
-        let mut dec = Decryptor::new(alg, dek, span.number, chunk_size);
-        let mut consumed_ct = 0u64;
         loop {
             match inner.frame().await {
                 Some(Ok(frame)) => {
-                    let Ok(mut data) = frame.into_data() else {
+                    let Ok(data) = frame.into_data() else {
                         continue;
                     };
-                    while !data.is_empty() {
-                        let piece = take_for_span(&mut data, &span, consumed_ct);
-                        consumed_ct += piece.len() as u64;
-                        if !emit_decrypt_result(dec.push(&piece), &tx, on_verify_failure.as_ref())
-                            .await
-                        {
-                            return;
-                        }
-                        if consumed_ct < span.ct_len {
-                            continue;
-                        }
-                        if !emit_decrypt_result(dec.finish(), &tx, on_verify_failure.as_ref()).await
-                        {
-                            return;
-                        }
-                        // Every part decrypted — whatever remains in
-                        // `data` (or arrives in a later frame) is the
-                        // footer and trailer. Stop here.
-                        let Some(next) = spans.next() else {
-                            return;
-                        };
-                        span = next;
-                        consumed_ct = 0;
-                        dec = Decryptor::new(alg, dek, span.number, chunk_size);
+                    if !cursor.feed(data, &tx, on_verify_failure.as_ref()).await {
+                        return;
                     }
                 }
                 Some(Err(e)) => {
@@ -497,7 +485,7 @@ where
                     return;
                 }
                 None => {
-                    if consumed_ct != span.ct_len {
+                    if cursor.ended_early() {
                         let _ = tx
                             .send(Err(io_err(
                                 "multipart object body ended before its last part",
@@ -510,6 +498,85 @@ where
         }
     });
     StreamBody::new(ReceiverStream(rx)).boxed()
+}
+
+/// The per-part cursor `decrypting_multipart` walks: the current span, its
+/// `Decryptor`, and how much of that span's ciphertext has been consumed so
+/// far.
+struct MultipartCursor {
+    alg: Alg,
+    dek: [u8; 32],
+    chunk_size: usize,
+    spans: std::vec::IntoIter<PartSpan>,
+    span: PartSpan,
+    dec: Decryptor,
+    consumed_ct: u64,
+}
+
+impl MultipartCursor {
+    /// `None` for an empty multipart object (no parts) — nothing to decrypt.
+    fn new(alg: Alg, dek: [u8; 32], chunk_size: usize, spans: Vec<PartSpan>) -> Option<Self> {
+        let mut spans = spans.into_iter();
+        let span = spans.next()?;
+        let dec = Decryptor::new(alg, dek, span.number, chunk_size);
+        Some(Self {
+            alg,
+            dek,
+            chunk_size,
+            spans,
+            span,
+            dec,
+            consumed_ct: 0,
+        })
+    }
+
+    /// Feeds one inbound frame's data through the per-part decryptors,
+    /// advancing to the next span each time a part's ciphertext is fully
+    /// consumed. Returns `false` when the stream must stop: a decrypt
+    /// failure, a closed receiver, or the last part finished (everything
+    /// after it is the footer and trailer, never forwarded).
+    async fn feed(
+        &mut self,
+        mut data: Bytes,
+        tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+        on_verify_failure: Option<&Arc<AtomicU64>>,
+    ) -> bool {
+        while !data.is_empty() {
+            let piece = take_for_span(&mut data, &self.span, self.consumed_ct);
+            self.consumed_ct += piece.len() as u64;
+            if !emit_decrypt_result(self.dec.push(&piece), tx, on_verify_failure).await {
+                return false;
+            }
+            if self.consumed_ct < self.span.ct_len {
+                continue;
+            }
+            // `finish()` takes `Decryptor` by value; swap in a fresh one
+            // (for the current span — cheap, just field init) so `self.dec`
+            // stays initialized while the old one is consumed. Overwritten
+            // below once the real next-span `Decryptor` is known, or the
+            // whole cursor is dropped when there's no next span.
+            let placeholder = Decryptor::new(self.alg, self.dek, self.span.number, self.chunk_size);
+            let dec = std::mem::replace(&mut self.dec, placeholder);
+            if !emit_decrypt_result(dec.finish(), tx, on_verify_failure).await {
+                return false;
+            }
+            // Every part decrypted — whatever remains in `data` (or
+            // arrives in a later frame) is the footer and trailer. Stop
+            // here.
+            let Some(next) = self.spans.next() else {
+                return false;
+            };
+            self.span = next;
+            self.consumed_ct = 0;
+            self.dec = Decryptor::new(self.alg, self.dek, self.span.number, self.chunk_size);
+        }
+        true
+    }
+
+    /// True at EOF only when the last part ended mid-ciphertext.
+    const fn ended_early(&self) -> bool {
+        self.consumed_ct != self.span.ct_len
+    }
 }
 
 /// Splits off the front of `data` for the current span, bounded by how much
