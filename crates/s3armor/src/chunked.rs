@@ -159,10 +159,6 @@ impl Dechunker {
 
     /// Feeds newly-received bytes. Returns every chunk that became
     /// complete as a result, in order.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "each index is bounded by a find_crlf/len check made just above it in the same arm"
-    )]
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<DecodedChunk>, ChunkedError> {
         if matches!(self.state, State::Done) && !bytes.is_empty() {
             return Err(ChunkedError::AlreadyDone);
@@ -170,72 +166,111 @@ impl Dechunker {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         loop {
-            match &self.state {
-                State::Header => {
-                    let Some(pos) = find_crlf(&self.buf) else {
-                        break;
-                    };
-                    let line = std::str::from_utf8(&self.buf[..pos])
-                        .map_err(|_| ChunkedError::MalformedHeader)?;
-                    let (size, signature) = parse_chunk_header(line)?;
-                    self.buf.drain(..pos + 2);
-                    if size == 0 {
-                        self.state = State::Trailers;
-                        // A zero-length chunk still carries a signature to
-                        // verify (over empty data) in the signed schemes.
-                        if let Some(sig) = signature {
-                            out.push((Vec::new(), Some(sig)));
-                        }
-                    } else {
-                        self.state = State::Data {
-                            remaining: size,
-                            signature,
-                        };
-                    }
-                }
-                State::Data {
-                    remaining,
-                    signature,
-                } => {
-                    if self.buf.len() < *remaining {
-                        break;
-                    }
-                    let data: Vec<u8> = self.buf.drain(..*remaining).collect();
-                    let signature = signature.clone();
-                    self.state = State::DataCrlf;
-                    out.push((data, signature));
-                }
-                State::DataCrlf => {
-                    if self.buf.len() < 2 {
-                        break;
-                    }
-                    if &self.buf[..2] != b"\r\n" {
-                        return Err(ChunkedError::MissingCrlf);
-                    }
-                    self.buf.drain(..2);
-                    self.state = State::Header;
-                }
-                State::Trailers => {
-                    let Some(pos) = find_crlf(&self.buf) else {
-                        break;
-                    };
-                    let line = self.buf[..pos].to_vec();
-                    self.buf.drain(..pos + 2);
-                    if line.is_empty() {
-                        self.state = State::Done;
-                        break;
-                    }
-                    let line =
-                        std::str::from_utf8(&line).map_err(|_| ChunkedError::MalformedTrailer)?;
-                    let (name, value) =
-                        line.split_once(':').ok_or(ChunkedError::MalformedTrailer)?;
-                    self.trailers
-                        .push((name.trim().to_string(), value.trim().to_string()));
-                }
-                State::Done => break,
+            let more = match self.state {
+                State::Header => self.step_header(&mut out)?,
+                State::Data { .. } => self.step_data(&mut out),
+                State::DataCrlf => self.step_data_crlf()?,
+                State::Trailers => self.step_trailers()?,
+                State::Done => false,
+            };
+            if !more {
+                break;
             }
         }
         Ok(out)
+    }
+
+    /// Parses one chunk-size header line, advancing to `Data` — or, for a
+    /// zero-length chunk, straight to `Trailers` (pushing its own
+    /// zero-length signed chunk first: a zero-length chunk still carries a
+    /// signature to verify, over empty data, in the signed schemes).
+    /// Returns `false` when the buffer doesn't yet hold a full line.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "pos is bounded by the find_crlf check made just above it"
+    )]
+    fn step_header(&mut self, out: &mut Vec<DecodedChunk>) -> Result<bool, ChunkedError> {
+        let Some(pos) = find_crlf(&self.buf) else {
+            return Ok(false);
+        };
+        let line =
+            std::str::from_utf8(&self.buf[..pos]).map_err(|_| ChunkedError::MalformedHeader)?;
+        let (size, signature) = parse_chunk_header(line)?;
+        self.buf.drain(..pos + 2);
+        if size == 0 {
+            self.state = State::Trailers;
+            if let Some(sig) = signature {
+                out.push((Vec::new(), Some(sig)));
+            }
+        } else {
+            self.state = State::Data {
+                remaining: size,
+                signature,
+            };
+        }
+        Ok(true)
+    }
+
+    /// Drains a chunk's data once the buffer holds all of it. Returns
+    /// `false` when it doesn't yet.
+    fn step_data(&mut self, out: &mut Vec<DecodedChunk>) -> bool {
+        let State::Data {
+            remaining,
+            signature,
+        } = &self.state
+        else {
+            unreachable!("feed only calls step_data while self.state is State::Data")
+        };
+        if self.buf.len() < *remaining {
+            return false;
+        }
+        let data: Vec<u8> = self.buf.drain(..*remaining).collect();
+        let signature = signature.clone();
+        self.state = State::DataCrlf;
+        out.push((data, signature));
+        true
+    }
+
+    /// Consumes the `\r\n` terminating a data chunk. Returns `false` when
+    /// the buffer doesn't yet hold both bytes.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "bounded by the buf.len() < 2 check made just above it"
+    )]
+    fn step_data_crlf(&mut self) -> Result<bool, ChunkedError> {
+        if self.buf.len() < 2 {
+            return Ok(false);
+        }
+        if &self.buf[..2] != b"\r\n" {
+            return Err(ChunkedError::MissingCrlf);
+        }
+        self.buf.drain(..2);
+        self.state = State::Header;
+        Ok(true)
+    }
+
+    /// Parses one trailer header line, or the empty line ending the
+    /// trailers section (state -> `Done`). Returns `false` when the buffer
+    /// doesn't yet hold a full line, or once `Done` is reached.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "pos is bounded by the find_crlf check made just above it"
+    )]
+    fn step_trailers(&mut self) -> Result<bool, ChunkedError> {
+        let Some(pos) = find_crlf(&self.buf) else {
+            return Ok(false);
+        };
+        let line = self.buf[..pos].to_vec();
+        self.buf.drain(..pos + 2);
+        if line.is_empty() {
+            self.state = State::Done;
+            return Ok(false);
+        }
+        let line = std::str::from_utf8(&line).map_err(|_| ChunkedError::MalformedTrailer)?;
+        let (name, value) = line.split_once(':').ok_or(ChunkedError::MalformedTrailer)?;
+        self.trailers
+            .push((name.trim().to_string(), value.trim().to_string()));
+        Ok(true)
     }
 }
 
