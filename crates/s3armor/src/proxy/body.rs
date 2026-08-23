@@ -93,7 +93,11 @@ pub fn hashing(mut inner: Incoming, expected_sha256_hex: String) -> ProxyBody {
 /// `chunk-signature=` (when `verifier` is `Some`) before that chunk's
 /// decoded bytes are forwarded. `verifier` is `None` for
 /// `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, whose chunks carry no signature.
-pub fn dechunking(mut inner: Incoming, mut verifier: Option<ChunkVerifier>) -> ProxyBody {
+pub fn dechunking<B>(mut inner: B, mut verifier: Option<ChunkVerifier>) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send,
+{
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
     tokio::spawn(async move {
         let mut dechunker = Dechunker::new();
@@ -383,14 +387,18 @@ pub fn decrypting_range(
     clippy::cast_possible_truncation,
     reason = "take = min(data.len(), remaining) as usize is bounded by data.len(), an already-usize value"
 )]
-pub fn decrypting_multipart(
-    mut inner: Incoming,
+pub fn decrypting_multipart<B>(
+    mut inner: B,
     alg: Alg,
     dek: [u8; 32],
     chunk_size: usize,
     spans: Vec<PartSpan>,
     on_verify_failure: Option<Arc<AtomicU64>>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send,
+{
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
     tokio::spawn(async move {
         let mut spans = spans.into_iter();
@@ -602,5 +610,255 @@ impl<T> futures_util::Stream for ReceiverStream<T> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<T>> {
         self.0.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::stream;
+    use s3armor_format::v1::{decrypt_all, encrypt_all, part_layout};
+
+    use super::*;
+    use crate::chunked::ChunkVerifier;
+    use crate::sigv4::canonical;
+
+    const KEY: [u8; 32] = [0x22; 32];
+    const CHUNK: usize = 16;
+
+    fn chunk_wire(data: &[u8], sig: Option<&str>) -> Vec<u8> {
+        let mut out = sig
+            .map_or_else(
+                || format!("{:x}\r\n", data.len()),
+                |s| format!("{:x};chunk-signature={s}\r\n", data.len()),
+            )
+            .into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    fn final_chunk(sig: Option<&str>) -> Vec<u8> {
+        sig.map_or_else(
+            || "0\r\n\r\n".to_string(),
+            |s| format!("0;chunk-signature={s}\r\n\r\n"),
+        )
+        .into_bytes()
+    }
+
+    /// Yields each byte slice as its own frame — lets a test drive several
+    /// `.frame()` reads instead of one, exercising the state `dechunking`
+    /// and `decrypting_multipart` carry across calls.
+    fn body_from_frames(frames: Vec<Vec<u8>>) -> ProxyBody {
+        let s = stream::iter(
+            frames
+                .into_iter()
+                .map(|f| Ok::<_, std::io::Error>(Frame::data(Bytes::from(f)))),
+        );
+        StreamBody::new(s).boxed()
+    }
+
+    async fn collect_ok(body: ProxyBody) -> Vec<u8> {
+        body.collect()
+            .await
+            .expect("expected a clean stream")
+            .to_bytes()
+            .to_vec()
+    }
+
+    fn verifier(seed: &str) -> ChunkVerifier {
+        ChunkVerifier::new(
+            KEY,
+            "20150830T123600Z".to_string(),
+            "20150830/us-east-1/s3/aws4_request".to_string(),
+            seed.to_string(),
+        )
+    }
+
+    /// The same chained signature `ChunkVerifier::verify_and_advance`
+    /// checks internally — its `expected` is private to `chunked`, so this
+    /// reproduces the formula documented at the top of that file.
+    fn chain_signature(prev: &str, data: &[u8]) -> String {
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n20150830T123600Z\n20150830/us-east-1/s3/aws4_request\n{prev}\n{}\n{}",
+            canonical::hex_sha256(b""),
+            canonical::hex_sha256(data)
+        );
+        canonical::signature_hex(&KEY, &sts)
+    }
+
+    #[tokio::test]
+    async fn dechunking_forwards_unsigned_chunks_across_multiple_frames() {
+        let mut wire = chunk_wire(b"hello ", None);
+        wire.extend(chunk_wire(b"world", None));
+        wire.extend(final_chunk(None));
+        // split mid-stream: Dechunker::feed is called more than once
+        // before the first chunk completes.
+        let (a, b) = wire.split_at(5);
+        let body = body_from_frames(vec![a.to_vec(), b.to_vec()]);
+        let out = collect_ok(dechunking(body, None)).await;
+        assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn dechunking_verifies_a_real_chunk_signature_chain() {
+        let seed = "0".repeat(64);
+        let sig1 = chain_signature(&seed, b"payload");
+        let mut wire = chunk_wire(b"payload", Some(&sig1));
+        wire.extend(final_chunk(Some(&chain_signature(&sig1, b""))));
+        let out = collect_ok(dechunking(full(Bytes::from(wire)), Some(verifier(&seed)))).await;
+        assert_eq!(out, b"payload");
+    }
+
+    #[tokio::test]
+    async fn dechunking_rejects_a_bad_chunk_signature() {
+        let seed = "0".repeat(64);
+        let wire = chunk_wire(b"payload", Some(&"f".repeat(64)));
+        let res = dechunking(full(Bytes::from(wire)), Some(verifier(&seed)))
+            .collect()
+            .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn dechunking_errors_on_eof_before_the_terminator() {
+        // a well-formed header with data short of its declared length, and
+        // no terminating zero-chunk behind it
+        let body = full(Bytes::from_static(b"5\r\nhel"));
+        let res = dechunking(body, None).collect().await;
+        assert!(res.is_err());
+    }
+
+    fn md5_of(data: &[u8]) -> [u8; 16] {
+        Md5::digest(data).into()
+    }
+
+    #[tokio::test]
+    async fn encrypting_round_trips_through_decryptor() {
+        let plaintext = b"the quick brown fox jumps over the lazy dog";
+        let body = full(Bytes::from_static(plaintext));
+        let ct = collect_ok(encrypting(body, Alg::Aes256Gcm, KEY, CHUNK, None, 0, None)).await;
+        let pt = decrypt_all(Alg::Aes256Gcm, &KEY, 0, CHUNK, &ct).expect("decrypts");
+        assert_eq!(pt, plaintext);
+    }
+
+    #[tokio::test]
+    async fn encrypting_rejects_a_content_md5_mismatch() {
+        let body = full(Bytes::from_static(b"payload"));
+        let wrong = [0u8; 16];
+        let res = encrypting(body, Alg::Aes256Gcm, KEY, CHUNK, Some(wrong), 0, None)
+            .collect()
+            .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypting_accepts_a_matching_content_md5() {
+        let plaintext = b"payload";
+        let body = full(Bytes::from_static(plaintext));
+        let expected = md5_of(plaintext);
+        let ct = collect_ok(encrypting(
+            body,
+            Alg::Aes256Gcm,
+            KEY,
+            CHUNK,
+            Some(expected),
+            0,
+            None,
+        ))
+        .await;
+        let pt = decrypt_all(Alg::Aes256Gcm, &KEY, 0, CHUNK, &ct).expect("decrypts");
+        assert_eq!(pt, plaintext);
+    }
+
+    #[tokio::test]
+    async fn encrypting_appends_the_trailer_after_the_final_frame() {
+        // AEAD sealing uses a fresh random nonce per frame, so ciphertext
+        // bytes aren't reproducible across two independent runs — but the
+        // framed length is deterministic, which is enough to locate the
+        // trailer split and decrypt the part in front of it.
+        let plaintext = b"payload";
+        let ct_len = encrypt_all(Alg::Aes256Gcm, &KEY, 0, CHUNK, plaintext).len();
+        let body = full(Bytes::from_static(plaintext));
+        let trailer = Bytes::from_static(b"TRAILER-BYTES");
+        let out = collect_ok(encrypting(
+            body,
+            Alg::Aes256Gcm,
+            KEY,
+            CHUNK,
+            None,
+            0,
+            Some(trailer.clone()),
+        ))
+        .await;
+        assert_eq!(out.len(), ct_len + trailer.len());
+        let pt = decrypt_all(Alg::Aes256Gcm, &KEY, 0, CHUNK, &out[..ct_len]).expect("decrypts");
+        assert_eq!(pt, plaintext);
+        assert_eq!(&out[ct_len..], trailer.as_ref());
+    }
+
+    type TwoPartObject = (Vec<(u32, &'static [u8])>, Vec<Vec<u8>>);
+
+    fn two_part_object() -> TwoPartObject {
+        let parts: Vec<(u32, &[u8])> = vec![
+            (1, b"first part plaintext"),
+            (2, b"second part, a bit longer than the first"),
+        ];
+        let cts = parts
+            .iter()
+            .map(|(n, pt)| encrypt_all(Alg::Aes256Gcm, &KEY, *n, CHUNK, pt))
+            .collect();
+        (parts, cts)
+    }
+
+    #[tokio::test]
+    async fn decrypting_multipart_walks_a_frame_that_straddles_a_span_boundary() {
+        let (parts, cts) = two_part_object();
+        let object: Vec<u8> = cts.iter().flatten().copied().collect();
+        let entries: Vec<(u32, u64)> = parts.iter().map(|(n, pt)| (*n, pt.len() as u64)).collect();
+        let spans = part_layout(Alg::Aes256Gcm, CHUNK as u64, &entries);
+
+        // fed as a single frame: its bytes straddle the part boundary,
+        // exercising the inner split/rollover loop.
+        let body = full(Bytes::from(object));
+        let out = collect_ok(decrypting_multipart(
+            body,
+            Alg::Aes256Gcm,
+            KEY,
+            CHUNK,
+            spans,
+            None,
+        ))
+        .await;
+
+        let expected: Vec<u8> = parts
+            .iter()
+            .flat_map(|(_, pt)| pt.iter().copied())
+            .collect();
+        assert_eq!(out, expected);
+    }
+
+    #[tokio::test]
+    async fn decrypting_multipart_reports_a_corrupted_part_and_stops() {
+        let (parts, mut cts) = two_part_object();
+        cts[0][0] ^= 0xFF; // corrupt a byte inside the first part's ciphertext
+        let object: Vec<u8> = cts.iter().flatten().copied().collect();
+        let entries: Vec<(u32, u64)> = parts.iter().map(|(n, pt)| (*n, pt.len() as u64)).collect();
+        let spans = part_layout(Alg::Aes256Gcm, CHUNK as u64, &entries);
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let body = full(Bytes::from(object));
+        let res = decrypting_multipart(
+            body,
+            Alg::Aes256Gcm,
+            KEY,
+            CHUNK,
+            spans,
+            Some(counter.clone()),
+        )
+        .collect()
+        .await;
+
+        assert!(res.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 }
