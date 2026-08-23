@@ -37,10 +37,18 @@ use crate::sigv4::canonical;
 /// string-to-sign, not a placeholder for this chunk's own data.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// Largest single `aws-chunked` chunk this proxy will buffer. Far above what
+/// any SDK sends (the AWS SDKs use 64 KiB-8 MiB), low enough that one
+/// authenticated connection cannot grow `Dechunker::buf` without bound by
+/// declaring — and sending — one enormous chunk.
+const MAX_DECLARED_CHUNK: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ChunkedError {
     #[error("malformed chunk header")]
     MalformedHeader,
+    #[error("declared chunk size exceeds the {MAX_DECLARED_CHUNK} byte limit")]
+    ChunkTooLarge,
     #[error("chunk data missing its terminating CRLF")]
     MissingCrlf,
     #[error("chunk signature does not match")]
@@ -284,6 +292,9 @@ fn parse_chunk_header(line: &str) -> Result<(usize, Option<String>), ChunkedErro
     let (size_hex, rest) = line.split_once(';').unwrap_or((line, ""));
     let size =
         usize::from_str_radix(size_hex.trim(), 16).map_err(|_| ChunkedError::MalformedHeader)?;
+    if size > MAX_DECLARED_CHUNK {
+        return Err(ChunkedError::ChunkTooLarge);
+    }
     if rest.is_empty() {
         return Ok((size, None));
     }
@@ -370,6 +381,20 @@ mod tests {
         let mut d = Dechunker::new();
         let err = d.feed(b"not-hex\r\n").unwrap_err();
         assert_eq!(err, ChunkedError::MalformedHeader);
+    }
+
+    #[test]
+    fn chunk_header_above_cap_is_rejected() {
+        let err = parse_chunk_header("FFFFFFFF").unwrap_err();
+        assert_eq!(err, ChunkedError::ChunkTooLarge);
+    }
+
+    #[test]
+    fn chunk_header_at_cap_is_accepted() {
+        let line = format!("{MAX_DECLARED_CHUNK:x}");
+        let (size, sig) = parse_chunk_header(&line).unwrap();
+        assert_eq!(size, MAX_DECLARED_CHUNK);
+        assert_eq!(sig, None);
     }
 
     // --- signature chain ---

@@ -938,6 +938,20 @@ fn load_keys(
         arr.copy_from_slice(&bytes);
         keys.insert(name, MasterKey::new(arr));
     }
+    // Two names holding the same key material collapse to one kid in the
+    // keyring (`Keyring::new`'s `by_kid` map is keyed by kid, not name) —
+    // silently, last-write-wins. Catch it here, where both names are still
+    // in hand, rather than let an operator wonder why removing one env var
+    // seemed to do nothing.
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for (name, k) in &keys {
+        if let Some(prev) = seen.insert(k.key_id(), name) {
+            return Err(ConfigError::Invalid(
+                "S3A_KEY_<NAME>",
+                format!("S3A_KEY_{prev} and S3A_KEY_{name} hold the same key material"),
+            ));
+        }
+    }
     Ok(keys)
 }
 
@@ -1078,6 +1092,19 @@ mod tests {
         let cfg = Config::load(&env).unwrap();
         assert_eq!(cfg.clients["NEXTCLOUD"].access_key, "nc");
         assert_eq!(cfg.clients["NEXTCLOUD"].secret_key, "ncsecret");
+    }
+
+    #[test]
+    fn two_keys_with_identical_material_is_an_error() {
+        let mut pairs = minimal();
+        pairs.push(("S3A_KEY_K2", TEST_KEY_B64));
+        let env = FakeEnv::new(&pairs);
+        let err = Config::load(&env).unwrap_err();
+        let ConfigError::Invalid(_, msg) = err else {
+            panic!("expected ConfigError::Invalid, got {err}");
+        };
+        assert!(msg.contains("S3A_KEY_K1"), "{msg}");
+        assert!(msg.contains("S3A_KEY_K2"), "{msg}");
     }
 
     #[test]
@@ -1498,7 +1525,12 @@ mod tests {
                 .join(format!("s3a-cfgfile-test-{}-key-file", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let key_path = dir.join("k2");
-            std::fs::write(&key_path, format!("{TEST_KEY_B64}\n")).unwrap();
+            // Distinct from K1's TEST_KEY_B64 (base64 of 32 zero bytes) —
+            // same material under two names is its own rejected case
+            // (`two_keys_with_identical_material_is_an_error`), not what
+            // this test is about.
+            let k2_key_b64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+            std::fs::write(&key_path, format!("{k2_key_b64}\n")).unwrap();
             let path = write_temp_toml(
                 "key-file-entry",
                 &format!(

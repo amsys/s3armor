@@ -324,6 +324,13 @@ pub async fn handle_complete(
             "CompleteMultipartUpload request lists no parts",
         ));
     }
+    // The sealed footer's format requires strictly ascending part numbers
+    // (`Footer::decode_record`) — reject here rather than sort, since the
+    // client's list order is what gets re-sent to the backend below via
+    // `build_complete_xml`.
+    if !parts_ascending(&client_parts) {
+        return Err(S3Error::invalid_part_order());
+    }
 
     let (alg, dek, parts_snapshot, tail) = {
         let mut entry = state
@@ -566,11 +573,23 @@ pub(crate) fn parse_single_tag(xml: &[u8], tag: &[u8]) -> Option<String> {
     }
 }
 
+/// True when `parts` is strictly ascending by part number — no duplicates,
+/// no reordering. The sealed footer's format requires this
+/// (`Footer::decode_record`); `handle_complete` rejects the request rather
+/// than sort when it isn't.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "windows(2) guarantees w.len() == 2, so w[0]/w[1] are always in range"
+)]
+fn parts_ascending(parts: &[(u32, String)]) -> bool {
+    parts.windows(2).all(|w| w[0].0 < w[1].0)
+}
+
 /// Parses `<CompleteMultipartUpload><Part><PartNumber>n</PartNumber>
 /// <ETag>"..."</ETag></Part>...</CompleteMultipartUpload>`, in the order
-/// the client sent it — ascending by part number is the client's job, not
-/// this parser's; `handle_complete` uses the recorded plaintext sizes keyed
-/// by part number regardless of list order.
+/// the client sent it — this parser does not sort or validate order;
+/// `handle_complete` rejects a non-ascending list right after calling this,
+/// since the sealed footer's format requires ascending part numbers.
 fn parse_complete_xml(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
     let text = std::str::from_utf8(body)
         .map_err(|_| S3Error::bad_gateway("CompleteMultipartUpload body is not valid UTF-8"))?;
@@ -709,5 +728,23 @@ mod tests {
             Some("abc/1".to_string())
         );
         assert_eq!(query_value("partNumber=3", "uploadId"), None);
+    }
+
+    #[test]
+    fn complete_with_descending_parts_is_rejected() {
+        let parts = vec![(5, "\"a\"".to_string()), (1, "\"b\"".to_string())];
+        assert!(!parts_ascending(&parts));
+    }
+
+    #[test]
+    fn complete_with_duplicate_part_number_is_rejected() {
+        let parts = vec![(1, "\"a\"".to_string()), (1, "\"b\"".to_string())];
+        assert!(!parts_ascending(&parts));
+    }
+
+    #[test]
+    fn complete_with_ascending_parts_is_accepted() {
+        let parts = vec![(1, "\"a\"".to_string()), (5, "\"b\"".to_string())];
+        assert!(parts_ascending(&parts));
     }
 }

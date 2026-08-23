@@ -163,6 +163,17 @@ impl S3Error {
         Self::new(StatusCode::BAD_REQUEST, "InvalidPart", message)
     }
 
+    /// `CompleteMultipartUpload`'s part list is not strictly ascending by
+    /// part number — the ordering the sealed footer's format requires
+    /// (`s3armor-format` `Footer::decode_record`).
+    pub fn invalid_part_order() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidPartOrder",
+            "The list of parts was not in ascending order",
+        )
+    }
+
     /// Renders the XML error body and a complete response, correlation id
     /// included in both the body and the `x-amz-request-id` header.
     #[expect(
