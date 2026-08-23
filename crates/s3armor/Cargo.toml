@@ -22,6 +22,7 @@ pprof = ["dep:pprof"]
 s3armor-format = { path = "../s3armor-format", version = "0.1.0" }
 rsa = "0.9"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }

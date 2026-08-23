@@ -58,6 +58,14 @@ point `s3armor` at it; a unit with `LoadCredential` but no matching
 Give the env file mode `0600`. It holds secrets, same as a Docker secret
 mount, just in one file instead of one file per secret.
 
+### 1.3 Shell completions
+
+```sh
+s3armor completions bash > /etc/bash_completion.d/s3armor
+s3armor completions zsh  > "${fpath[1]}/_s3armor"
+s3armor completions fish > ~/.config/fish/completions/s3armor.fish
+```
+
 ## 2. Quickstart
 
 Four steps: generate a key, point at a backend, preflight, run.
@@ -291,12 +299,10 @@ copying an object between backends never makes it undecryptable. Run
 and that backend's endpoint.
 
 Every tool that talks to exactly one backend per run (`s3armor check`,
-`s3armor rewrap`, `s3armor rebind`, and `s3armor bench --backend`)
-takes a `--backend <NAME>` flag (`s3armor bench` uses `--backend-name`,
-since `--backend` on that command already means "run the backend
-tier"). The flag is optional when only one backend is configured, and
-required — with the same "list every configured name" error — once a
-second backend exists.
+`s3armor rewrap`, `s3armor rebind`, and `s3armor bench --backend-tier`)
+takes the same `--backend <NAME>` flag. The flag is optional when only
+one backend is configured, and required — with the same "list every
+configured name" error — once a second backend exists.
 
 ### 3.3 Optional configuration file
 

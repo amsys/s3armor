@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tooling-check: generate a key -> `s3armor check --bucket` full green against
-# real MinIO -> `s3armor bench` local/--backend/--proxy tiers all run ->
+# real MinIO -> `s3armor bench` local/--backend-tier/--proxy tiers all run ->
 # `--write-config` output is valid env `s3armor serve` accepts.
 #
 # Requires: docker, cargo, aws-cli v2.
@@ -80,8 +80,8 @@ echo "== s3armor bench (local tier) =="
 env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" bench | tee "$WORKDIR/bench-local.txt"
 grep -q "recommended: S3A_ALG=" "$WORKDIR/bench-local.txt"
 
-echo "== s3armor bench --backend --bucket $BUCKET =="
-env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" bench --backend --bucket "$BUCKET" | tee "$WORKDIR/bench-backend.txt"
+echo "== s3armor bench --backend-tier --bucket $BUCKET =="
+env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" bench --backend-tier --bucket "$BUCKET" | tee "$WORKDIR/bench-backend.txt"
 grep -q "max sustained concurrency" "$WORKDIR/bench-backend.txt"
 
 echo "== starting s3armor serve on :$PROXY_PORT for the --proxy tier =="

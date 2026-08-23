@@ -1,15 +1,15 @@
 //! s3armor — client-side S3 encryption proxy and tooling.
 //!
-//! All seven subcommands (`serve`, `check`, `bench`, `rewrap`, `rebind`,
-//! `config`, `health-probe`) are implemented. Key material is generated
-//! with `openssl`, not a dedicated subcommand — see docs/USER-GUIDE.md
-//! "Quickstart".
+//! All eight subcommands (`serve`, `check`, `bench`, `rewrap`, `rebind`,
+//! `config`, `health-probe`, `completions`) are implemented. Key material is
+//! generated with `openssl`, not a dedicated subcommand — see
+//! docs/USER-GUIDE.md "Quickstart".
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
@@ -47,6 +47,15 @@ enum Command {
     Config,
     /// Liveness probe for containers without a shell.
     HealthProbe,
+    /// Print a shell completion script.
+    Completions(CompletionsCli),
+}
+
+#[derive(Args)]
+struct CompletionsCli {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
 }
 
 #[derive(Args)]
@@ -66,13 +75,12 @@ struct BenchCli {
     /// Also run the backend tier: TTFB, throughput ladder, and concurrency
     /// discovery against the configured backend, direct.
     #[arg(long)]
-    backend: bool,
-    /// Which configured backend the --backend/--proxy tiers run against.
-    /// Required if more than one backend is configured; optional (and
-    /// implied) with exactly one. Named `--backend-name`, not `--backend`
-    /// — that flag already means "run the backend tier" (bool).
+    backend_tier: bool,
+    /// Which configured backend the --backend-tier/--proxy tiers run
+    /// against. Required if more than one backend is configured; optional
+    /// (and implied) with exactly one.
     #[arg(long)]
-    backend_name: Option<String>,
+    backend: Option<String>,
     /// Also run the proxy tier: proxy-vs-direct efficiency ratio against a
     /// running proxy instance at this URL, with SHA-256 verification.
     #[arg(long)]
@@ -203,6 +211,14 @@ async fn main() {
         Some(Command::Check(args)) => run_check(args, config_path.as_deref()).await,
         Some(Command::Bench(args)) => run_bench(args, config_path.as_deref()).await,
         Some(Command::Rebind(args)) => run_rebind(args, config_path.as_deref()).await,
+        Some(Command::Completions(args)) => {
+            clap_complete::generate(
+                args.shell,
+                &mut Cli::command(),
+                "s3armor",
+                &mut std::io::stdout(),
+            );
+        }
     }
 }
 
@@ -229,18 +245,18 @@ async fn run_bench(args: BenchCli, config_path: Option<&str>) {
         tools::bench::print_local(&local);
     }
 
-    if !args.backend && args.proxy.is_none() {
+    if !args.backend_tier && args.proxy.is_none() {
         return;
     }
     let Some(bucket) = args.bucket else {
-        eprintln!("s3armor: bench: --bucket is required with --backend/--proxy");
+        eprintln!("s3armor: bench: --bucket is required with --backend-tier/--proxy");
         std::process::exit(1);
     };
     let config = load_config_or_exit(config_path);
     let state = Arc::new(ProxyState::new(config));
-    let backend = resolve_backend_or_exit(&state, args.backend_name.as_deref());
+    let backend = resolve_backend_or_exit(&state, args.backend.as_deref());
 
-    if args.backend {
+    if args.backend_tier {
         let results = tools::bench::run_backend(&state, backend, &bucket).await;
         if args.json {
             println!("{}", tools::bench::backend_json(&results));
