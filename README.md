@@ -1,4 +1,15 @@
-# s3armor
+<p align="center">
+  <img src="assets/s3armor.png" alt="s3armor" width="180">
+</p>
+
+<h1 align="center">s3armor</h1>
+
+<p align="center">
+  <a href="https://github.com/amsys/s3armor/actions/workflows/ci.yml"><img src="https://github.com/amsys/s3armor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://sonarcloud.io/summary/new_code?id=amsys_s3armor"><img src="https://sonarcloud.io/api/project_badges/measure?project=amsys_s3armor&amp;metric=alert_status" alt="Quality Gate"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg" alt="License: AGPL v3"></a>
+  <img src="https://img.shields.io/badge/status-beta-orange" alt="Status: beta">
+</p>
 
 *Client-side encryption proxy for S3, forged in Rust.*
 
