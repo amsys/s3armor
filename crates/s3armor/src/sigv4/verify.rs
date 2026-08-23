@@ -343,15 +343,17 @@ fn verify_presigned(
     if date8(amz_date) != credential.date8 {
         return Err(VerifyError::DateMismatch);
     }
-    let age = now
-        .duration_since(request_time)
-        .map_err(|_| VerifyError::ClockSkew)?
-        .as_secs();
     // A presigned URL issued in the future beyond the skew window is as
-    // suspicious as an expired one.
+    // suspicious as an expired one. Check this first: `duration_since`
+    // below only succeeds when `request_time <= now`, so a signed-skew
+    // check placed after it would never run for a future-dated request.
     if request_time > now && skew_seconds(now, request_time) > MAX_SKEW_SECS {
         return Err(VerifyError::ClockSkew);
     }
+    let age = now
+        .duration_since(request_time)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_secs();
     if age > expires {
         return Err(VerifyError::Expired);
     }
@@ -697,6 +699,72 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, VerifyError::Expired);
+    }
+
+    #[test]
+    fn presigned_url_slightly_in_the_future_is_accepted() {
+        let headers = vec![("Host".to_string(), "example.amazonaws.com".to_string())];
+        let query_no_sig = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host";
+        let sig = sign_for_test(
+            "GET",
+            "/obj",
+            query_no_sig,
+            &headers,
+            &["host".into()],
+            "UNSIGNED-PAYLOAD",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "us-east-1",
+            "s3",
+            "20150830T123600Z",
+        );
+        let full_query = format!("{query_no_sig}&X-Amz-Signature={sig}");
+        // The client's clock runs a minute fast: `X-Amz-Date` is a minute
+        // ahead of the proxy's `now`, well inside the +/-15 minute window.
+        let earlier = amz_now() - Duration::from_mins(1);
+        let id = verify(
+            "GET",
+            "/obj",
+            &full_query,
+            &headers,
+            "UNSIGNED-PAYLOAD",
+            &client_map(),
+            earlier,
+        )
+        .unwrap();
+        assert_eq!(id.access_key, "AKIDEXAMPLE");
+    }
+
+    #[test]
+    fn presigned_url_far_in_the_future_rejected() {
+        let headers = vec![("Host".to_string(), "example.amazonaws.com".to_string())];
+        let query_no_sig = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host";
+        let sig = sign_for_test(
+            "GET",
+            "/obj",
+            query_no_sig,
+            &headers,
+            &["host".into()],
+            "UNSIGNED-PAYLOAD",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "us-east-1",
+            "s3",
+            "20150830T123600Z",
+        );
+        let full_query = format!("{query_no_sig}&X-Amz-Signature={sig}");
+        let earlier = amz_now() - Duration::from_mins(30);
+        let err = verify(
+            "GET",
+            "/obj",
+            &full_query,
+            &headers,
+            "UNSIGNED-PAYLOAD",
+            &client_map(),
+            earlier,
+        )
+        .unwrap_err();
+        assert_eq!(err, VerifyError::ClockSkew);
     }
 
     #[test]
