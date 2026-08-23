@@ -80,6 +80,10 @@ The lint policy lives in `Cargo.toml`'s `[workspace.lints]` and in
 - `clippy.toml` allows `unwrap`/`expect`/`panic`/indexing in test code only
   (`allow-unwrap-in-tests = true` and its siblings). Production code has no
   such allowance.
+- `clippy::cognitive_complexity` is on, with
+  `cognitive-complexity-threshold = 15` in `clippy.toml`. This is the same
+  limit SonarCloud's S3776 rule uses. Clippy's metric is an approximation of
+  Sonar's, so the two numbers can differ.
 - Every `#[expect(clippy::...)]` in the tree carries a `reason = "..."`
   naming the specific invariant that makes the lint a false positive at
   that one site. Do not delete an `#[expect(...)]` without first checking

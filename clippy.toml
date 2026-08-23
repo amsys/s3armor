@@ -4,3 +4,5 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 avoid-breaking-exported-api = false
+# SonarCloud S3776 uses a limit of 15; keep the local gate at the same number.
+cognitive-complexity-threshold = 15

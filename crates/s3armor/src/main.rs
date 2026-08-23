@@ -354,36 +354,41 @@ async fn run_rebind(args: RebindCli, config_path: Option<&str>) {
     }
 }
 
-/// Unix-only signals for the shutdown trigger below: this proxy's only
-/// shipping target is Linux (musl Docker image, Proxmox LXC,
-/// `docs/ARCHITECTURE.md` "Deployment").
-#[expect(
-    clippy::expect_used,
-    reason = "a failure to install a signal handler is a startup-time environment fault \
-              (e.g. no signal support at all) with no recovery — fail loudly, not silently \
-              run un-drainable"
-)]
-async fn serve(config_path: Option<&str>) {
-    let config = load_config_or_exit(config_path);
+/// Build the TLS acceptor from `S3A_TLS_CERT`/`S3A_TLS_KEY`, or `None` when TLS
+/// isn't configured. Exits the process on a load failure — same posture as
+/// `load_config_or_exit`, since a misconfigured cert/key is a startup fault.
+fn build_tls_acceptor(
+    tls: Option<&s3armor::config::TlsConfig>,
+) -> Option<tokio_rustls::TlsAcceptor> {
+    let t = tls?;
+    let server_config = match s3armor::tls::load_server_config(&t.cert_path, &t.key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("s3armor: cannot load S3A_TLS_CERT/S3A_TLS_KEY: {e}");
+            std::process::exit(1);
+        }
+    };
+    Some(tokio_rustls::TlsAcceptor::from(server_config))
+}
 
-    let listen = config.listen.clone();
-    let tls_acceptor = config.tls.as_ref().map(|t| {
-        let server_config = match s3armor::tls::load_server_config(&t.cert_path, &t.key_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("s3armor: cannot load S3A_TLS_CERT/S3A_TLS_KEY: {e}");
-                std::process::exit(1);
-            }
-        };
-        tokio_rustls::TlsAcceptor::from(server_config)
-    });
-    let listener = match TcpListener::bind(&listen).await {
+/// Bind the listen address, or exit the process — same posture as
+/// `load_config_or_exit`.
+async fn bind_or_exit(listen: &str) -> TcpListener {
+    match TcpListener::bind(listen).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("s3armor: cannot bind {listen}: {e}");
             std::process::exit(1);
         }
-    };
+    }
+}
+
+async fn serve(config_path: Option<&str>) {
+    let config = load_config_or_exit(config_path);
+
+    let listen = config.listen.clone();
+    let tls_acceptor = build_tls_acceptor(config.tls.as_ref());
+    let listener = bind_or_exit(&listen).await;
     tracing::info!(
         listen,
         backends = config.backends.len(),
@@ -418,6 +423,39 @@ async fn serve(config_path: Option<&str>) {
     // the count reflects exactly the connections still live.
     let in_flight = Arc::new(());
 
+    accept_loop(
+        listener,
+        tls_acceptor,
+        &state,
+        shutdown_tx,
+        shutdown_rx,
+        &in_flight,
+    )
+    .await;
+}
+
+/// Accept connections until SIGTERM/SIGINT triggers a bounded drain, then
+/// keep accepting (so `/health`'s 503 stays observable) until either
+/// `in_flight` reaches zero or the deadline passes. Split out of `serve`
+/// because this loop, not the startup sequence around it, is where the
+/// control flow — and so the cognitive complexity — actually lives.
+///
+/// Unix-only signals: this proxy's only shipping target is Linux (musl
+/// Docker image, Proxmox LXC, `docs/ARCHITECTURE.md` "Deployment").
+#[expect(
+    clippy::expect_used,
+    reason = "a failure to install a signal handler is a startup-time environment fault \
+              (e.g. no signal support at all) with no recovery — fail loudly, not silently \
+              run un-drainable"
+)]
+async fn accept_loop(
+    listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    state: &Arc<ProxyState>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    in_flight: &Arc<()>,
+) {
     // Registered once, outside the loop: `Signal` is reused across
     // iterations rather than re-installing a handler on every accepted
     // connection.
@@ -442,7 +480,7 @@ async fn serve(config_path: Option<&str>) {
             match draining_deadline {
                 Some(deadline) => {
                     wait_for_drain(
-                        &in_flight,
+                        in_flight,
                         deadline.saturating_duration_since(tokio::time::Instant::now()),
                     )
                     .await;

@@ -404,16 +404,17 @@ async fn handle_inner(
     // GetPart/UploadPartCopy/Select fail before the body is even read —
     // same posture as the old blanket multipart rejection, just narrowed
     // to the operations v1 genuinely does not support.
-    if op == route::Op::Mpu(route::MpuOp::GetPart) {
-        return Err(intercept::mpu::get_part_unsupported());
-    }
-    if op == route::Op::Mpu(route::MpuOp::UploadPartCopy) {
-        return Err(intercept::mpu::upload_part_copy_unsupported());
-    }
-    if op == route::Op::SelectObjectContent {
-        return Err(S3Error::not_implemented(
-            "SelectObjectContent (the backend would query ciphertext, not your data; download and query locally)",
-        ));
+    match op {
+        route::Op::Mpu(route::MpuOp::GetPart) => return Err(intercept::mpu::get_part_unsupported()),
+        route::Op::Mpu(route::MpuOp::UploadPartCopy) => {
+            return Err(intercept::mpu::upload_part_copy_unsupported());
+        }
+        route::Op::SelectObjectContent => {
+            return Err(S3Error::not_implemented(
+                "SelectObjectContent (the backend would query ciphertext, not your data; download and query locally)",
+            ));
+        }
+        _ => {}
     }
 
     let (_parts, incoming) = req.into_parts();

@@ -51,6 +51,7 @@ string_slice = "warn"
 verbose_file_reads = "warn"
 rest_pat_in_fully_bound_structs = "warn"
 try_err = "warn"
+cognitive_complexity = "warn"
 
 [profile.release]
 lto = "thin"
