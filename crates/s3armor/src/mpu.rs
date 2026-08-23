@@ -38,16 +38,27 @@ pub struct CachedComplete {
     pub body: Bytes,
 }
 
+/// Total buffered ciphertext a session's `tails` may hold before the lowest
+/// part number gets evicted — three sub-5-MiB parts' worth. Bounds the RAM a
+/// client can force this node to hold for one upload; a Complete whose last
+/// part fell out of the cap fails loudly (`S3Error::invalid_part`) rather
+/// than silently mis-merging.
+pub const MAX_TAIL_BYTES: usize = 3 * 5 * 1024 * 1024;
+
 pub struct Session {
     pub dek: [u8; 32],
     pub alg: Alg,
     pub chunk_size: u32,
     pub parts: BTreeMap<u32, PartRecord>,
-    /// The highest-numbered part's ciphertext, held back only while it is
-    /// under S3's 5 MiB non-final-part minimum — merged with the footer at
-    /// Complete instead of costing an extra, otherwise-too-small part. A
-    /// strictly higher part number arriving drops the buffer.
-    pub tail: Option<(u32, Bytes)>,
+    /// Every currently-uploaded part's ciphertext that is still under S3's 5
+    /// MiB non-final-part minimum, keyed by part number — any of these could
+    /// turn out to be the client's real last part at Complete, so each is
+    /// merged with the footer instead of costing an extra, otherwise-too-small
+    /// part. A part number leaving this map (re-uploaded at >= 5 MiB) is
+    /// removed; the total stays under `MAX_TAIL_BYTES` by evicting the lowest
+    /// part number first — the part a Complete finishes with is almost always
+    /// the highest.
+    pub tails: BTreeMap<u32, Bytes>,
     pub last_activity: Instant,
     pub completed: Option<CachedComplete>,
 }
@@ -65,7 +76,7 @@ impl Session {
             alg,
             chunk_size,
             parts: BTreeMap::new(),
-            tail: None,
+            tails: BTreeMap::new(),
             last_activity: Instant::now(),
             completed: None,
         }
@@ -73,6 +84,18 @@ impl Session {
 
     pub fn touch(&mut self) {
         self.last_activity = Instant::now();
+    }
+
+    /// Buffers `ct` under `part_number`, then evicts the lowest-numbered
+    /// buffered part while the total exceeds `MAX_TAIL_BYTES`.
+    pub fn buffer_tail(&mut self, part_number: u32, ct: Bytes) {
+        self.tails.insert(part_number, ct);
+        while self.tails.values().map(Bytes::len).sum::<usize>() > MAX_TAIL_BYTES {
+            let Some(&lowest) = self.tails.keys().next() else {
+                break;
+            };
+            self.tails.remove(&lowest);
+        }
     }
 
     fn expired(&self, ttl: Duration) -> bool {
@@ -156,6 +179,28 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ct(len: usize) -> Bytes {
+        Bytes::from(vec![0u8; len])
+    }
+
+    #[test]
+    fn buffer_tail_keeps_every_part_under_the_cap() {
+        let mut s = Session::new([0u8; 32], Alg::Aes256Gcm, 1024);
+        s.buffer_tail(2, ct(1024));
+        s.buffer_tail(3, ct(1024));
+        assert_eq!(s.tails.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn buffer_tail_evicts_the_lowest_part_number_over_the_cap() {
+        let mut s = Session::new([0u8; 32], Alg::Aes256Gcm, 1024);
+        s.buffer_tail(1, ct(MAX_TAIL_BYTES));
+        s.buffer_tail(2, ct(1));
+        // Part 1 alone already fills the cap; adding part 2 must evict the
+        // lowest (part 1), not the one just inserted.
+        assert_eq!(s.tails.keys().copied().collect::<Vec<_>>(), vec![2]);
+    }
 
     #[test]
     fn a_removed_session_is_no_longer_retrievable() {

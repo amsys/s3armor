@@ -63,9 +63,19 @@ pub fn to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
 
 /// Removes headers that must never reach the backend as the client sent
 /// them. Call this *after* SigV4 verification — see the module doc comment.
+///
+/// Also strips inbound `x-amz-meta-s3a-*`: this proxy's own reserved
+/// metadata namespace. Every write op sets its real `s3a-*` values after
+/// this point (`intercept::put`, `intercept::mpu::handle_create`), so a
+/// client can never make its own value survive — without this, a forged
+/// `x-amz-meta-s3a-mp: 1` on a plain PUT would route every later GET/HEAD
+/// of that object into the multipart footer path, where it fails to parse
+/// and the object becomes permanently unreadable through the proxy.
 pub fn strip_for_backend(headers: &mut Vec<(String, String)>) {
     headers.retain(|(name, _)| {
-        !STRIP_ALWAYS.iter().any(|s| name.eq_ignore_ascii_case(s)) && !is_checksum_header(name)
+        !STRIP_ALWAYS.iter().any(|s| name.eq_ignore_ascii_case(s))
+            && !is_checksum_header(name)
+            && !is_own_metadata_header(name)
     });
 }
 
@@ -177,6 +187,17 @@ mod tests {
         strip_for_backend(&mut headers);
         let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, vec!["Host", "Content-Type"]);
+    }
+
+    #[test]
+    fn strips_inbound_s3armor_metadata_but_keeps_other_meta() {
+        let mut headers = vec![
+            ("x-amz-meta-s3a-mp".to_string(), "1".to_string()),
+            ("x-amz-meta-app-id".to_string(), "42".to_string()),
+        ];
+        strip_for_backend(&mut headers);
+        let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["x-amz-meta-app-id"]);
     }
 
     #[test]

@@ -236,7 +236,10 @@ Decrypt routing order on read: `s3a-v=1` present → v1 path. Else →
 passthrough (a pre-existing plaintext object). An unrecognized `s3a-kid`
 returns an explicit `KeyNotAvailable` error, never a silent failure. The
 proxy strips exactly the `s3a-*` metadata set from every response it
-returns to the client.
+returns to the client — and, symmetrically, from every incoming request
+before forwarding: a client cannot set its own `x-amz-meta-s3a-*` value
+(`headers::strip_for_backend`), so a forged `s3a-mp` on a plain PUT can
+never route a later GET/HEAD of that object into the wrong decrypt path.
 
 ### Multipart v1
 
@@ -263,14 +266,21 @@ The footer cannot always be appended as one more part. S3 requires every
 part except the last to be at least 5 MiB. Appending the footer as an
 extra final part would turn the client's real final part — usually well
 under 5 MiB — into a middle part, and the backend would reject the whole
-upload. The fix: the proxy buffers the highest-numbered part's ciphertext
-only while it stays under 5 MiB, dropping that buffer the moment a
-higher-numbered part arrives. At Complete, if a final part is still
-buffered, the proxy re-uploads it merged with the sealed footer under the
-same part number — no extra part, no size problem. Otherwise the footer
-goes up as its own part, which is safely non-final-sized by then. Either
-way the object's raw byte stream is identical: every part's ciphertext,
-then the footer frame, then the trailer.
+upload. The fix: the proxy buffers every sub-5-MiB part's ciphertext by
+part number (capped, lowest part number evicted first once the cap is
+hit), because a legal `CompleteMultipartUpload` can name any previously
+uploaded part as the last one, not just the highest part number ever seen
+— an unreferenced part is simply discarded by real S3. A part re-uploaded
+at 5 MiB or larger clears its own buffer entry. At Complete: if the
+client's actual final part is still buffered, the proxy re-uploads it
+merged with the sealed footer under the same part number — no extra part,
+no size problem; if it is not buffered but is itself at least 5 MiB, the
+footer goes up as its own part; if it is not buffered and still under 5
+MiB (evicted by the cap), Complete is rejected with `InvalidPart` rather
+than letting the backend reject the whole upload with an opaque
+`EntityTooSmall`. Either way a successful Complete's raw byte stream is
+identical: every part's ciphertext, then the footer frame, then the
+trailer.
 
 - `HeadObject`, sequential `GetObject`, and ranged `GetObject` on multipart
   objects resolve sizes with one ranged read of the footer (the last 16
@@ -409,7 +419,7 @@ runs with parallel workers, a checkpoint file for resumability, and a
 | `HeadObject` | intercepted: plaintext size fixup (v1 math / footer read) |
 | Create/Upload/Complete/Abort multipart | intercepted ("Multipart v1"); Complete is safe to retry; part list is validated |
 | `ListParts` | passthrough — the backend's own XML; part sizes are ciphertext sizes, same caveat as "List sizes are ciphertext sizes" |
-| `CopyObject` | passthrough by default for a v1 source (metadata copies with the object; ciphertext is not path-bound), plus one diagnostic `HEAD` against the source issued directly to the backend before the copy. With `BIND_PATHS` enabled, a v1 source instead goes through a thin DEK-rewrap interceptor, still one server-side copy. `metadata-directive: REPLACE` against an encrypted source is rejected, since it would drop the `s3a-*` metadata and orphan the object. |
+| `CopyObject` | passthrough by default for a v1 source (metadata copies with the object; ciphertext is not path-bound), plus one diagnostic `HEAD` against the source issued directly to the backend before the copy. With `BIND_PATHS` enabled, a v1 source instead goes through a thin DEK-rewrap interceptor, still one server-side copy. `metadata-directive: REPLACE` against an encrypted source is rejected, since it would drop the `s3a-*` metadata and orphan the object. `x-amz-copy-source-if-match`/`-if-none-match` are translated from the plaintext ETag the client was handed to the backend's stored ETag, same as `If-Match`/`If-None-Match` on GET/HEAD ("ETag policy"); `-if-modified-since`/`-if-unmodified-since` are left as-is, since they compare `Last-Modified`, which this proxy never rewrites. |
 | `UploadPartCopy` | `501`, in v1: ciphertext cannot be re-chunked server-side |
 | `GetObject?partNumber` | `501` — fetching one part of an already completed object is not supported in v1; fetch the whole object instead |
 | `GetObjectAttributes` | passthrough — the backend's own XML; reported size and ETag are ciphertext, same caveat as "List sizes are ciphertext sizes" |

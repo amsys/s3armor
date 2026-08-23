@@ -90,6 +90,15 @@ fn list_contains(list: &str, target: &str) -> bool {
     list.split(',').any(|raw| normalize_tag(raw) == target)
 }
 
+/// Whether an ETag list (comma-separated, weak-prefix and quoting variants
+/// all accepted) contains `etag` — the same matching `Conditionals::evaluate`
+/// uses for `If-Match`/`If-None-Match`, exposed for `intercept::copy`'s
+/// `x-amz-copy-source-if-*` translation so both paths agree on what "the
+/// same ETag" means.
+pub(crate) fn list_contains_etag(list: &str, etag: &str) -> bool {
+    list_contains(list, normalize_tag(etag))
+}
+
 /// Builds the `304 Not Modified` response: no body, just the identifying
 /// headers a client needs to keep its cached copy.
 pub(crate) fn not_modified_response(
@@ -188,5 +197,12 @@ mod tests {
         let mut headers = vec![("if-match".to_string(), "\"a\", \"b\", \"c\"".to_string())];
         let conds = Conditionals::take(&mut headers);
         assert_eq!(conds.evaluate("\"b\""), Precondition::Proceed);
+    }
+
+    #[test]
+    fn list_contains_etag_matches_through_quotes_and_weak_prefix() {
+        assert!(list_contains_etag("\"a\", W/\"b\"", "\"b\""));
+        assert!(list_contains_etag("\"a\"", "a"));
+        assert!(!list_contains_etag("\"a\"", "\"z\""));
     }
 }

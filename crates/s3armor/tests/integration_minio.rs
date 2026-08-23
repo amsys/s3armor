@@ -555,6 +555,81 @@ async fn put_get_round_trip_is_byte_exact_and_at_rest_is_ciphertext() {
     );
 }
 
+/// Adversarial: a client forges the proxy's own reserved
+/// `x-amz-meta-s3a-*` bookkeeping keys on a plain PutObject —
+/// `s3a-mp: 1` would route every later GET/HEAD into the multipart-footer
+/// branch, `s3a-v: 99` would make it look like an unknown future format
+/// version — hoping to make the object it just wrote unreadable through
+/// the proxy, or worse, smuggle a value into `ObjectMeta::from_map`. Both
+/// must be stripped by the shared write-path strip point
+/// (`proxy::headers::strip_for_backend`) before the real `s3a-*` keys are
+/// written, so the object round-trips exactly as if the client never sent
+/// them.
+#[tokio::test]
+async fn forged_s3armor_metadata_on_put_is_stripped_not_stored() {
+    let (client, _endpoint, minio_endpoint, _minio) = setup().await;
+    let bucket = "forged-metadata";
+    let key = "poisoned.bin";
+    let plaintext = b"attempted metadata poisoning".to_vec();
+
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create bucket");
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .metadata("s3a-mp", "1")
+        .metadata("s3a-v", "99")
+        .metadata("s3a-kid", "not-a-real-key-id")
+        .body(ByteStream::from(plaintext.clone()))
+        .send()
+        .await
+        .expect("put object with forged s3armor metadata");
+
+    // The object must stay fully readable — a forged s3a-mp: 1 that
+    // survived would route this GET into the multipart-footer branch and
+    // fail the whole request with a 502, not just leak a stray header.
+    let got = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("get object after forged-metadata put");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), plaintext.as_slice());
+
+    // And the real stored metadata is this proxy's own, not the client's
+    // forged values.
+    let raw = minio_client(&minio_endpoint);
+    let stored = raw
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("direct MinIO get");
+    let metadata = stored.metadata().cloned().unwrap_or_default();
+    assert_eq!(
+        metadata.get("s3a-v").map(String::as_str),
+        Some("1"),
+        "s3a-v must be this proxy's real format version, not the forged 99"
+    );
+    assert_ne!(
+        metadata.get("s3a-kid").map(String::as_str),
+        Some("not-a-real-key-id"),
+        "s3a-kid must be this proxy's real active key id, not the forged value"
+    );
+    assert!(
+        !metadata.contains_key("s3a-mp"),
+        "a single-part PUT must never carry s3a-mp"
+    );
+}
+
 #[tokio::test]
 async fn xchacha20_round_trip_matches_the_aes_path() {
     // `setup_with`'s own doc comment names this override as its reason to
@@ -1871,6 +1946,91 @@ async fn conditional_requests_evaluate_against_the_plaintext_etag() {
         .await
         .expect_err("a matching conditional must short-circuit a ranged GET too");
     assert_eq!(raw_status(&err), 304);
+}
+
+/// `x-amz-copy-source-if-match`/`-if-none-match` name the plaintext ETag
+/// this proxy handed the client for the source object, same as
+/// `If-Match`/`If-None-Match` on GET/HEAD — they must be translated to the
+/// backend's own stored ETag before the copy is forwarded, or a matching
+/// `if-match` would spuriously fail (backend compares against ciphertext)
+/// and a non-matching `if-none-match` would spuriously succeed a copy the
+/// client meant to skip.
+#[tokio::test]
+async fn copy_source_conditionals_evaluate_against_the_plaintext_etag() {
+    let (client, _endpoint, _minio_endpoint, _minio) = setup().await;
+    let bucket = "copy-source-conditional-etag";
+    let src_key = "source.bin";
+    let dst_key = "dest.bin";
+    let body = b"the quick brown fox jumps over the lazy dog";
+    let digest = <md5::Md5 as md5::Digest>::digest(body);
+    let md5_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    };
+    let etag = format!("\"{}\"", hex::encode(digest));
+
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create bucket");
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(src_key)
+        .content_md5(md5_b64)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .expect("put with content-md5");
+
+    // Copy-source-if-match with the plaintext ETag the client was handed
+    // must proceed, not 412 against the backend's ciphertext ETag.
+    client
+        .copy_object()
+        .bucket(bucket)
+        .key(dst_key)
+        .copy_source(format!("{bucket}/{src_key}"))
+        .copy_source_if_match(&etag)
+        .send()
+        .await
+        .expect("copy-source-if-match on the effective ETag must proceed");
+    let got = client
+        .get_object()
+        .bucket(bucket)
+        .key(dst_key)
+        .send()
+        .await
+        .expect("get the copy");
+    let bytes = got.body.collect().await.expect("collect body").into_bytes();
+    assert_eq!(bytes.as_ref(), body);
+
+    // Copy-source-if-match with a wrong ETag must still 412.
+    let err = client
+        .copy_object()
+        .bucket(bucket)
+        .key("dest-should-not-exist.bin")
+        .copy_source(format!("{bucket}/{src_key}"))
+        .copy_source_if_match("\"bogus\"")
+        .send()
+        .await
+        .expect_err("non-matching copy-source-if-match must yield 412, not succeed");
+    assert_eq!(raw_status(&err), 412);
+
+    // Copy-source-if-none-match with the plaintext ETag the client was
+    // handed must be rejected — this is the direction where a client asking
+    // to skip an unchanged source must not have its copy silently proceed.
+    let err = client
+        .copy_object()
+        .bucket(bucket)
+        .key("dest-should-also-not-exist.bin")
+        .copy_source(format!("{bucket}/{src_key}"))
+        .copy_source_if_none_match(&etag)
+        .send()
+        .await
+        .expect_err("copy-source-if-none-match on the effective ETag must be rejected");
+    assert_eq!(raw_status(&err), 412);
 }
 
 /// `If-Match: *`/`If-None-Match: *` are existence checks, not content

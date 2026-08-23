@@ -19,13 +19,27 @@
 //! guards against) — so the copy unwraps under the source's binding and
 //! re-wraps under the destination's, same metadata-only self-copy shape
 //! `tools::rewrap` uses.
+//!
+//! `x-amz-copy-source-if-match`/`-if-none-match` name the *effective* ETag
+//! this proxy handed the client (`intercept::effective_etag`) — the
+//! plaintext MD5 for a v1 single-part source with `s3a-emd5` — but the
+//! backend only knows its own stored (ciphertext) ETag. Left untranslated,
+//! a client's `if-match` on the ETag it was given would spuriously fail,
+//! and — worse — its `if-none-match` would spuriously succeed a copy the
+//! client meant to skip because it believed the source unchanged. Both
+//! headers are rewritten to the backend's ETag when the client's list
+//! names the effective one, mirroring `intercept::conditional`'s
+//! GET/HEAD translation. `-if-modified-since`/`-if-unmodified-since` are
+//! left untouched: they compare `Last-Modified`, which this proxy never
+//! rewrites, same as `conditional.rs`'s own note on the date headers.
 
 use http::{Response, StatusCode};
 
 use s3armor_format::v1::ObjectMeta;
 
 use crate::config::{Backend, BindMode};
-use crate::intercept::{binding_for, resolve_key_for, route_from_headers, Routing};
+use crate::intercept::conditional::list_contains_etag;
+use crate::intercept::{binding_for, effective_etag, resolve_key_for, route_from_headers, Routing};
 use crate::proxy::body::{self, ProxyBody};
 use crate::proxy::error::S3Error;
 use crate::proxy::headers::{is_own_metadata_header, to_pairs};
@@ -37,7 +51,7 @@ pub async fn handle(
     backend: &Backend,
     raw_path: &str,
     raw_query: &str,
-    outbound_headers: Vec<(String, String)>,
+    mut outbound_headers: Vec<(String, String)>,
     request_id: &str,
 ) -> Result<Response<ProxyBody>, S3Error> {
     let copy_source = header_value(&outbound_headers, "x-amz-copy-source")
@@ -79,6 +93,19 @@ pub async fn handle(
     }
     let head_headers = to_pairs(head_resp.headers());
     let routing = route_from_headers(&head_headers)?;
+
+    // The client's copy-source conditionals name the ETag this proxy handed
+    // it, not what the backend stores under — translate before either copy
+    // path below forwards them. A no-op for passthrough/multipart sources,
+    // where the two already agree.
+    if let (Some(effective), Some(backend_etag)) = (
+        effective_etag(state, &routing, &head_headers, &src_path),
+        header_value(&head_headers, "etag"),
+    ) {
+        if effective != backend_etag {
+            translate_copy_source_conditionals(&mut outbound_headers, &effective, backend_etag);
+        }
+    }
 
     let is_replace = header_value(&outbound_headers, "x-amz-metadata-directive")
         .is_some_and(|v| v.eq_ignore_ascii_case("REPLACE"));
@@ -203,4 +230,70 @@ async fn rewrap_copy(
     )
     .await?;
     Ok(translate_response(backend_resp, request_id))
+}
+
+/// Rewrites `x-amz-copy-source-if-match`/`-if-none-match` from the
+/// effective ETag this proxy handed the client to the backend's own stored
+/// ETag, when the client's list names the effective one. Leaves a header
+/// untouched when it names something else — a plaintext-MD5 list already
+/// evaluates "no match" correctly against the stored ciphertext ETag.
+fn translate_copy_source_conditionals(
+    headers: &mut [(String, String)],
+    effective_etag: &str,
+    backend_etag: &str,
+) {
+    for name in [
+        "x-amz-copy-source-if-match",
+        "x-amz-copy-source-if-none-match",
+    ] {
+        if let Some((_, value)) = headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            if list_contains_etag(value, effective_etag) {
+                value.clear();
+                value.push_str(backend_etag);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_a_header_naming_the_effective_etag() {
+        let mut headers = vec![(
+            "x-amz-copy-source-if-match".to_string(),
+            "\"plaintext-md5\"".to_string(),
+        )];
+        translate_copy_source_conditionals(
+            &mut headers,
+            "\"plaintext-md5\"",
+            "\"ciphertext-etag\"",
+        );
+        assert_eq!(headers[0].1, "\"ciphertext-etag\"");
+    }
+
+    #[test]
+    fn leaves_a_header_naming_something_else_untouched() {
+        let mut headers = vec![(
+            "x-amz-copy-source-if-none-match".to_string(),
+            "\"some-other-etag\"".to_string(),
+        )];
+        translate_copy_source_conditionals(
+            &mut headers,
+            "\"plaintext-md5\"",
+            "\"ciphertext-etag\"",
+        );
+        assert_eq!(headers[0].1, "\"some-other-etag\"");
+    }
+
+    #[test]
+    fn missing_header_is_a_no_op() {
+        let mut headers: Vec<(String, String)> = vec![];
+        translate_copy_source_conditionals(&mut headers, "\"a\"", "\"b\"");
+        assert!(headers.is_empty());
+    }
 }

@@ -11,16 +11,24 @@
 //! S3 requires every part but the last to be >= 5 MiB. Appending the
 //! footer as its own extra final part would turn the client's real final
 //! part — usually well under 5 MiB — into a middle part, and the backend
-//! would reject the whole upload with `EntityTooSmall`. So: the
-//! highest-numbered part's ciphertext is buffered in the session
-//! (`Session::tail`) only while it is under 5 MiB, and dropped the moment a
-//! higher part number arrives. At Complete, if the client's actual last
+//! would reject the whole upload with `EntityTooSmall`. So: every
+//! sub-5-MiB part's ciphertext is buffered in the session
+//! (`Session::tails`, capped at `mpu::MAX_TAIL_BYTES` — the lowest part
+//! number is evicted first once the cap is hit), because a legal
+//! `CompleteMultipartUpload` can name any previously-uploaded part as the
+//! last one, not just the highest part number ever seen — an unreferenced
+//! part is simply discarded by real S3. A part re-uploaded at >= 5 MiB
+//! clears its own buffer entry. At Complete, if the client's actual last
 //! part is still buffered, it is re-uploaded merged with the footer under
-//! the same part number (no extra part, no size problem); otherwise the
-//! footer goes up as its own — now safely non-final-sized — extra part.
-//! Either way the object's raw byte stream is identical: every part's
-//! ciphertext, then the footer frame, then the trailer. `decrypting_multipart`
-//! and `intercept::footer` don't need to know which branch happened.
+//! the same part number (no extra part, no size problem); if it isn't
+//! buffered but is itself >= 5 MiB, the footer goes up as its own — now
+//! safely non-final-sized — extra part; if it isn't buffered and is still
+//! under 5 MiB (evicted by the cap), Complete is rejected with
+//! `InvalidPart` rather than silently producing a backend `EntityTooSmall`.
+//! Either way a successful Complete's raw byte stream is identical: every
+//! part's ciphertext, then the footer frame, then the trailer.
+//! `decrypting_multipart` and `intercept::footer` don't need to know which
+//! branch happened.
 
 use std::fmt::Write as _;
 
@@ -253,13 +261,10 @@ pub async fn handle_upload_part(
     Ok(translate_response(backend_resp, request_id))
 }
 
-/// Records a completed part and applies the tail-buffer rule: the buffer
-/// tracks only the *current* highest-numbered part, so a strictly higher
-/// part number arriving always replaces (or clears) it.
-#[expect(
-    clippy::expect_used,
-    reason = "the line above always inserts into entry.parts, so its key set is never empty here"
-)]
+/// Records a completed part and applies the tail-buffer rule: every
+/// sub-5-MiB part's ciphertext is buffered (capped, `Session::buffer_tail`)
+/// so Complete can find whichever part it actually finishes with; a part
+/// re-uploaded at >= 5 MiB clears its own stale buffer entry.
 fn record_part(
     state: &ProxyState,
     session_key: &SessionKey,
@@ -270,13 +275,11 @@ fn record_part(
 ) {
     if let Some(mut entry) = state.sessions.get_mut(session_key) {
         entry.parts.insert(part_number, PartRecord { pt_len, etag });
-        let highest = *entry
-            .parts
-            .keys()
-            .next_back()
-            .expect("just inserted a part, so the map is non-empty");
-        if part_number == highest {
-            entry.tail = ct.map(|c| (part_number, c));
+        match ct {
+            Some(c) => entry.buffer_tail(part_number, c),
+            None => {
+                entry.tails.remove(&part_number);
+            }
         }
         entry.touch();
     }
@@ -331,8 +334,13 @@ pub async fn handle_complete(
     if !parts_ascending(&client_parts) {
         return Err(S3Error::invalid_part_order());
     }
+    let last_number = client_parts
+        .iter()
+        .map(|(n, _)| *n)
+        .max()
+        .expect("checked non-empty above");
 
-    let (alg, dek, parts_snapshot, tail) = {
+    let (alg, dek, chunk_size, parts_snapshot, tail) = {
         let mut entry = state
             .sessions
             .get_mut(&session_key)
@@ -361,15 +369,31 @@ pub async fn handle_complete(
             .iter()
             .map(|(n, _)| (*n, entry.parts[n].pt_len))
             .collect();
-        (entry.alg, entry.dek, parts_snapshot, entry.tail.clone())
+        let tail = entry.tails.get(&last_number).cloned();
+        (entry.alg, entry.dek, entry.chunk_size, parts_snapshot, tail)
     };
 
     let total_pt: u64 = parts_snapshot.iter().map(|(_, size)| *size).sum();
-    let last_number = client_parts
-        .iter()
-        .map(|(n, _)| *n)
-        .max()
-        .expect("checked non-empty above");
+    // The last part not buffered: if it is still under S3's 5 MiB minimum,
+    // it was evicted from the capped tail buffer (or the client re-uses a
+    // part number in a way this node never buffered) — sealing the footer
+    // as its own extra part would turn this last part into a middle part
+    // and the backend would reject the whole upload with `EntityTooSmall`.
+    // Fail loudly instead of leaving that opaque error as the client's only
+    // signal.
+    if tail.is_none() {
+        let last_pt_len = parts_snapshot
+            .iter()
+            .find(|(n, _)| *n == last_number)
+            .map_or(0, |(_, len)| *len);
+        if ciphertext_len(alg, last_pt_len, u64::from(chunk_size)) < MIN_PART_SIZE {
+            return Err(S3Error::invalid_part(format!(
+                "part {last_number} is under S3's 5 MiB minimum and is no longer buffered on \
+                 this node (displaced by a higher part number, or the session's tail buffer is \
+                 full); re-upload it as the highest part number and complete again"
+            )));
+        }
+    }
     let footer = Footer {
         alg,
         parts: parts_snapshot,
@@ -379,7 +403,7 @@ pub async fn handle_complete(
     let sealed_footer = footer.seal(&dek);
 
     let mut final_parts = client_parts.clone();
-    if let Some((tail_number, tail_ct)) = tail.filter(|(n, _)| *n == last_number) {
+    if let Some(tail_ct) = tail {
         let mut merged = tail_ct.to_vec();
         merged.extend_from_slice(&sealed_footer);
         let etag = upload_raw_part(
@@ -387,12 +411,12 @@ pub async fn handle_complete(
             backend,
             raw_path,
             &upload_id,
-            tail_number,
+            last_number,
             Bytes::from(merged),
         )
         .await?;
         for (n, e) in &mut final_parts {
-            if *n == tail_number {
+            if *n == last_number {
                 e.clone_from(&etag);
             }
         }

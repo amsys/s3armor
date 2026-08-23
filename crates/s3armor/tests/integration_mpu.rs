@@ -840,3 +840,97 @@ async fn tail_buffer_switch_at_the_exact_5mib_ciphertext_boundary() {
         );
     }
 }
+
+/// A legal S3 pattern: Complete lists a subset of the uploaded parts,
+/// dropping an unreferenced one. Part 3 (small) displaces part 2's (small)
+/// tail buffer before Complete finishes with part 2 — without buffering
+/// every sub-5-MiB part, this fell back to sealing the footer as its own
+/// extra part, leaving part 2 as an under-5-MiB middle part the backend
+/// rejects with `EntityTooSmall`.
+#[tokio::test]
+async fn complete_with_a_subset_of_parts_still_merges_the_right_tail() {
+    let (client, _minio, _ep, _c, _state) = setup().await;
+    let key = "subset-complete.bin";
+    let upload_id = create_upload(&client, key).await;
+
+    let p1 = payload(BIG_PART, 1);
+    let p2 = payload(500, 2);
+    let p3 = payload(500, 3);
+    let e1 = upload_one(&client, key, &upload_id, 1, p1.clone()).await;
+    let e2 = upload_one(&client, key, &upload_id, 2, p2.clone()).await;
+    let _e3 = upload_one(&client, key, &upload_id, 3, p3).await;
+    // Complete with [1, 2] only — part 3 is uploaded but never referenced,
+    // same as real S3 allows.
+    complete(&client, key, &upload_id, vec![(1, e1), (2, e2)]).await;
+
+    let got = get_bytes(&client, key).await;
+    let mut want = p1;
+    want.extend(p2);
+    assert_eq!(got, want);
+}
+
+/// Adversarial version of the subset-complete test above: instead of one
+/// displacing part, upload enough small "decoy" parts to exceed
+/// `mpu::MAX_TAIL_BYTES` (three sub-5-MiB parts' worth) and evict the part
+/// the client actually intends to finish with. Complete must fail loudly
+/// with `InvalidPart` — the documented remaining gap — never corrupt the
+/// object or panic.
+#[tokio::test]
+async fn complete_referencing_a_tail_evicted_by_decoy_parts_fails_cleanly() {
+    // ~4 MiB plaintext -> ~4.0 MiB ciphertext at the test chunk size,
+    // safely under the 5 MiB tail-buffering threshold. Five of these
+    // exceed the 15 MiB tail cap, evicting the lowest part numbers first.
+    const SMALL: usize = 4 * 1024 * 1024;
+
+    let (client, minio, _ep, _c, _state) = setup().await;
+    let key = "evicted-tail.bin";
+    let upload_id = create_upload(&client, key).await;
+    let mut etags = Vec::new();
+    for n in 1..=5 {
+        etags.push(upload_one(&client, key, &upload_id, n, payload(SMALL, n as u8)).await);
+    }
+
+    // A legal S3 pattern (parts 3-5 are simply discarded) — but parts 1
+    // and 2 were evicted from the tail buffer by parts 3, 4, 5 landing
+    // after them, so part 2 (the real last part here) is no longer
+    // buffered when Complete runs.
+    let completed = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(etags[0].clone())
+                .build(),
+            CompletedPart::builder()
+                .part_number(2)
+                .e_tag(etags[1].clone())
+                .build(),
+        ]))
+        .build();
+    let err = client
+        .complete_multipart_upload()
+        .bucket("mpu-test")
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect_err("Complete referencing an evicted tail part must fail, not corrupt");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("InvalidPart"),
+        "expected InvalidPart, got: {msg}"
+    );
+
+    // Nothing was ever sealed under this key — no half-written object.
+    let listing = minio
+        .list_objects_v2()
+        .bucket("mpu-test")
+        .prefix(key)
+        .send()
+        .await
+        .expect("ListObjectsV2 direct to MinIO");
+    assert!(
+        listing.contents().iter().all(|o| o.key() != Some(key)),
+        "no object should exist at {key} after a failed Complete"
+    );
+}
