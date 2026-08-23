@@ -281,20 +281,18 @@ fn health_response(draining: bool) -> Response<ProxyBody> {
 #[expect(clippy::expect_used, reason = "static ready response always builds")]
 async fn ready_response(state: &ProxyState) -> Response<ProxyBody> {
     let mut status = StatusCode::OK;
-    let mut text = "ready";
+    let mut text = "ready".to_string();
     for backend in state.config.backends.values() {
-        if forward(state, backend, "GET", "/", "", Vec::new(), body::empty())
-            .await
-            .is_err()
-        {
+        if let Err(e) = forward(state, backend, "GET", "/", "", Vec::new(), body::empty()).await {
+            tracing::warn!(backend = %backend.name, error = %e, "/ready: backend unreachable");
             status = StatusCode::SERVICE_UNAVAILABLE;
-            text = "backend unreachable";
+            text = format!("backend unreachable: {}", backend.name);
             break;
         }
     }
     Response::builder()
         .status(status)
-        .body(body::full(Bytes::from_static(text.as_bytes())))
+        .body(body::full(Bytes::from(text)))
         .expect("static ready response always builds")
 }
 

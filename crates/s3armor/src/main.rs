@@ -148,13 +148,32 @@ fn load_config_or_exit(config_path: Option<&str>) -> Config {
             std::process::exit(1);
         }
     };
-    match Config::load(&env) {
+    let config = match Config::load(&env) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("s3armor: config error: {e}");
             std::process::exit(1);
         }
-    }
+    };
+    init_tracing(&config);
+    config
+}
+
+/// Installs the `tracing` subscriber from `S3A_LOG`/`S3A_LOG_FORMAT`. Every
+/// subcommand routes through `load_config_or_exit`, so this runs once no
+/// matter which one is invoked — previously only `serve` called this,
+/// which meant `check`/`bench`/`rewrap`/`rebind` ran with `S3A_LOG=debug`
+/// having no effect and any `tracing::warn!` from the shared `forward`
+/// machinery they reuse going nowhere. `try_init` rather than `init`: a
+/// second call (there is none today, but a future one) should not panic.
+fn init_tracing(config: &Config) {
+    let filter = tracing_subscriber::EnvFilter::try_new(&config.log_level)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+    let _ = match config.log_format {
+        s3armor::config::LogFormat::Json => subscriber.json().try_init(),
+        s3armor::config::LogFormat::Text => subscriber.try_init(),
+    };
 }
 
 /// Resolves a tool's `--backend` flag the same way, for the same reason, on
@@ -330,14 +349,6 @@ async fn run_rebind(args: RebindCli, config_path: Option<&str>) {
 )]
 async fn serve(config_path: Option<&str>) {
     let config = load_config_or_exit(config_path);
-    let format = config.log_format;
-    let filter = tracing_subscriber::EnvFilter::try_new(&config.log_level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
-    match format {
-        s3armor::config::LogFormat::Json => subscriber.json().init(),
-        s3armor::config::LogFormat::Text => subscriber.init(),
-    }
 
     let listen = config.listen.clone();
     let tls_acceptor = config.tls.as_ref().map(|t| {
@@ -360,9 +371,20 @@ async fn serve(config_path: Option<&str>) {
     tracing::info!(
         listen,
         backends = config.backends.len(),
+        clients = config.clients.len(),
         tls = tls_acceptor.is_some(),
         "s3armor listening"
     );
+    if config.clients.is_empty() {
+        // Not fatal — a zero-client proxy is a legitimate transient state
+        // while an operator is still setting up — but every request 403s
+        // (`sigv4::verify::resolve_client`) until at least one
+        // S3A_CLIENT_<NAME>_ACCESS_KEY is configured, and that is easy to
+        // miss silently.
+        tracing::warn!(
+            "no S3A_CLIENT_<NAME>_ACCESS_KEY configured — every request will be rejected"
+        );
+    }
 
     let state = Arc::new(ProxyState::new(config));
     state.spawn_mpu_sweeper();
@@ -542,7 +564,10 @@ async fn spawn_metrics_listener(state: &Arc<ProxyState>) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("s3armor: cannot bind S3A_METRICS {addr}: {e}");
+            // `tracing::error!`, not `eprintln!` — this needs to reach the
+            // same log pipeline as everything else here, or it breaks
+            // `S3A_LOG_FORMAT=json` output with a stray unstructured line.
+            tracing::error!(addr, error = %e, "cannot bind S3A_METRICS");
             return;
         }
     };
@@ -582,9 +607,23 @@ async fn spawn_metrics_listener(state: &Arc<ProxyState>) {
 
 async fn health_probe(config_path: Option<&str>) {
     let config = load_config_or_exit(config_path);
-    // `S3A_LISTEN` is a bind address (often `0.0.0.0:PORT`); the probe
-    // needs somewhere to actually connect to.
-    let target = config.listen.replacen("0.0.0.0", "127.0.0.1", 1);
+    // `S3A_LISTEN` is a bind address (often `0.0.0.0:PORT` or `[::]:PORT`);
+    // the probe needs somewhere to actually connect to, not the unspecified
+    // address itself. Parse rather than a literal-string substitution, so
+    // both the IPv4 and IPv6 unspecified forms are handled the same way;
+    // fall back to the original string if it isn't a plain `ip:port` (a
+    // hostname, which needs no rewriting).
+    let target = match config.listen.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let loopback = if addr.is_ipv6() {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            };
+            std::net::SocketAddr::new(loopback, addr.port()).to_string()
+        }
+        _ => config.listen.clone(),
+    };
     let req_result = if config.tls.is_some() {
         let url = format!("https://{target}/health");
         let _ = rustls::crypto::ring::default_provider().install_default();

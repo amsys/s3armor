@@ -105,7 +105,28 @@ fn scalar(v: &toml::Value) -> Result<String, ConfigError> {
 /// -> `S3A_METRICS`, `[crypto].*` -> `S3A_*` with no `CRYPTO_` prefix at
 /// all), so a generic transform would need its own exception list — this
 /// table *is* that list, just direct instead of two layers deep.
+/// Top-level scalar keys, beyond the tables in [`TABLES`] and the
+/// operator-named tables below — everything reachable via `root.get(...)`
+/// in this file, spelled out once so an unrecognized top-level key is a
+/// startup error instead of a silently-ignored typo (misconfiguration is
+/// fatal at startup everywhere else in this crate; a `config.toml` typo
+/// was the one gap).
+const TOP_LEVEL_SCALARS: &[&str] = &["listen", "log", "log_format", "bind_paths"];
+/// Tables named by the operator (`[backends.mine]`, `[clients.nextcloud]`,
+/// `[keys]`'s per-key entries) rather than a fixed set of legal names —
+/// excluded from the unknown-key check below by design, not an oversight.
+const TOP_LEVEL_DYNAMIC_TABLES: &[&str] = &["backends", "clients", "keys"];
+
 fn flatten(root: &toml::Table) -> Result<BTreeMap<String, String>, ConfigError> {
+    for key in root.keys() {
+        let known = TOP_LEVEL_SCALARS.contains(&key.as_str())
+            || TOP_LEVEL_DYNAMIC_TABLES.contains(&key.as_str())
+            || TABLES.iter().any(|(name, _)| name == key);
+        if !known {
+            return Err(ConfigError::UnknownKey(key.clone()));
+        }
+    }
+
     let mut out = BTreeMap::new();
 
     if let Some(v) = root.get("listen") {
@@ -200,6 +221,11 @@ fn flatten_simple_tables(
         let Some(toml::Value::Table(t)) = root.get(*table_name) else {
             continue;
         };
+        for key in t.keys() {
+            if !keys.iter().any(|(k, _)| k == key) {
+                return Err(ConfigError::UnknownKey(format!("{table_name}.{key}")));
+            }
+        }
         for (key, env_name) in *keys {
             if let Some(v) = t.get(*key) {
                 out.insert((*env_name).to_string(), scalar(v)?);

@@ -1,0 +1,49 @@
+name: Release
+
+# Publishes the image the docs point operators at (README.md "Install",
+# docs/USER-GUIDE.md "1.1 Docker"). CI's own `docker` job only builds and
+# discards, as a per-PR build check — this is the one workflow that
+# actually pushes.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  IMAGE: ghcr.io/amsys/s3armor
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag "v0.1.0" -> image tag "0.1.0" — docs show a bare version, not
+      # the "v" prefix git tags use.
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # linux/arm64 alongside amd64: the docs point at a low-power ARM NAS
+      # as a deployment target (docs/ARCHITECTURE.md "Optimizations"),
+      # which an amd64-only image would not actually serve.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest

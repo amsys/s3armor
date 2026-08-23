@@ -48,6 +48,8 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("both {0} and {0}_FILE are set — set only one")]
     BothSet(String),
+    #[error("both {0} and {1} are set — set only one")]
+    BothSetPair(&'static str, &'static str),
     #[error("cannot read {0}_FILE at {1}: {2}")]
     FileRead(String, String, std::io::Error),
     #[error("invalid value for {0}: {1}")]
@@ -60,6 +62,8 @@ pub enum ConfigError {
     SecretInFile(String),
     #[error("client {0} names unknown backend {1} — known backends: {2}")]
     UnknownBackend(String, String, String),
+    #[error("config file names unknown key {0} — check for a typo")]
+    UnknownKey(String),
 }
 
 /// One resolved value plus where it came from, for `s3armor config` reporting.
@@ -379,7 +383,12 @@ impl Config {
         let log_format = match log_format_raw.as_str() {
             "text" => LogFormat::Text,
             "json" => LogFormat::Json,
-            other => return Err(ConfigError::Invalid("S3A_LOG_FORMAT", other.to_string())),
+            other => {
+                return Err(ConfigError::Invalid(
+                    "S3A_LOG_FORMAT",
+                    format!("{other} — must be one of: text, json"),
+                ))
+            }
         };
 
         let backends = load_backends(env, &mut sources)?;
@@ -409,14 +418,26 @@ impl Config {
             .parse()
             .ok()
             .filter(|n| (MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(n))
-            .ok_or_else(|| ConfigError::Invalid("S3A_CHUNK_SIZE", chunk_size_raw.clone()))?;
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "S3A_CHUNK_SIZE",
+                    format!(
+                        "{chunk_size_raw} — must be a number of bytes between {MIN_CHUNK_SIZE} and {MAX_CHUNK_SIZE}"
+                    ),
+                )
+            })?;
 
         let alg_raw = optional(env, &mut sources, "S3A_ALG", "auto")?;
         let alg = match alg_raw.as_str() {
             "auto" if has_aes_hw() => Alg::Aes256Gcm,
             "aes-gcm" => Alg::Aes256Gcm,
             "auto" | "xchacha20-poly1305" => Alg::XChaCha20Poly1305,
-            other => return Err(ConfigError::Invalid("S3A_ALG", other.to_string())),
+            other => {
+                return Err(ConfigError::Invalid(
+                    "S3A_ALG",
+                    format!("{other} — must be one of: auto, aes-gcm, xchacha20-poly1305"),
+                ))
+            }
         };
 
         let key_active_name = required(env, &mut sources, "S3A_KEY_ACTIVE")?;
@@ -475,7 +496,12 @@ impl Config {
             "off" => BindMode::Off,
             "on" => BindMode::On,
             "strict" => BindMode::Strict,
-            other => return Err(ConfigError::Invalid("S3A_BIND_PATHS", other.to_string())),
+            other => {
+                return Err(ConfigError::Invalid(
+                    "S3A_BIND_PATHS",
+                    format!("{other} — must be one of: off, on, strict"),
+                ))
+            }
         };
 
         Ok(Self {
@@ -630,16 +656,21 @@ impl Config {
 }
 
 fn parse_duration_secs(raw: &str, name: &'static str) -> Result<Duration, ConfigError> {
-    raw.parse::<u64>()
-        .map(Duration::from_secs)
-        .map_err(|_| ConfigError::Invalid(name, raw.to_string()))
+    raw.parse::<u64>().map(Duration::from_secs).map_err(|_| {
+        ConfigError::Invalid(name, format!("{raw} — must be a whole number of seconds"))
+    })
 }
 
 /// Parses a duration as a bare seconds count or a single `<n><unit>` suffix
 /// (`s`/`m`/`h`/`d`) — `S3A_MP_TTL`'s `24h` reads better in `docker-compose`
 /// than `86400`, and a bare number still works for scripts.
 fn parse_duration(raw: &str, name: &'static str) -> Result<Duration, ConfigError> {
-    let invalid = || ConfigError::Invalid(name, raw.to_string());
+    let invalid = || {
+        ConfigError::Invalid(
+            name,
+            format!("{raw} — must be a whole number of seconds, or <n> followed by s/m/h/d"),
+        )
+    };
     if let Ok(secs) = raw.parse::<u64>() {
         return Ok(Duration::from_secs(secs));
     }
@@ -973,9 +1004,7 @@ fn load_rsa_kek(
         .entry("S3A_RSA_PUBLIC".to_string())
         .or_insert(Source::Default);
     match (private, public) {
-        (Some(_), Some(_)) => Err(ConfigError::BothSet(
-            "S3A_RSA_KEY and S3A_RSA_PUBLIC".to_string(),
-        )),
+        (Some(_), Some(_)) => Err(ConfigError::BothSetPair("S3A_RSA_KEY", "S3A_RSA_PUBLIC")),
         (Some(r), None) => {
             sources.insert("S3A_RSA_KEY".to_string(), r.source);
             RsaKek::from_private_pem(&r.value)
@@ -1092,6 +1121,19 @@ mod tests {
         let cfg = Config::load(&env).unwrap();
         assert_eq!(cfg.clients["NEXTCLOUD"].access_key, "nc");
         assert_eq!(cfg.clients["NEXTCLOUD"].secret_key, "ncsecret");
+    }
+
+    #[test]
+    fn both_rsa_key_and_rsa_public_is_a_named_error() {
+        let mut pairs = minimal();
+        pairs.push(("S3A_RSA_KEY", "irrelevant"));
+        pairs.push(("S3A_RSA_PUBLIC", "irrelevant"));
+        let env = FakeEnv::new(&pairs);
+        let err = Config::load(&env).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::BothSetPair("S3A_RSA_KEY", "S3A_RSA_PUBLIC")
+        ));
     }
 
     #[test]
@@ -1602,6 +1644,32 @@ mod tests {
                 }
                 other => panic!("expected ConfigFileParse naming the path, got {other:?}"),
             }
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[test]
+        fn unknown_top_level_table_is_rejected() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            // A plausible typo: `[timeout]` for `[timeouts]` — previously
+            // silently ignored, running on defaults.
+            let path = write_temp_toml("unknown-top-level", "[timeout]\nconnect = 5\n");
+            let err = Layered::new(Some(path.to_str().unwrap())).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::UnknownKey(k) if k == "timeout"),
+                "expected UnknownKey(timeout), got {err:?}"
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[test]
+        fn unknown_key_within_a_known_table_is_rejected() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let path = write_temp_toml("unknown-in-table", "[timeouts]\nconect = 5\n");
+            let err = Layered::new(Some(path.to_str().unwrap())).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::UnknownKey(k) if k == "timeouts.conect"),
+                "expected UnknownKey(timeouts.conect), got {err:?}"
+            );
             std::fs::remove_dir_all(path.parent().unwrap()).ok();
         }
 
