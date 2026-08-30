@@ -13,6 +13,12 @@ const FOOTER_PART_NUMBER: u32 = u32::MAX;
 pub const TRAILER_LEN: usize = 16;
 const FOOTER_MAGIC: [u8; 8] = *b"S3A1FOOT";
 
+/// Largest sealed footer frame this format accepts. The trailer length
+/// field sits outside the AEAD frame, so an attacker with backend write
+/// access controls it. A real footer for 10000 parts is about 120 KiB; this
+/// cap stops a crafted trailer from making a reader buffer a whole object.
+const MAX_FOOTER_LEN: u64 = 128 * 1024;
+
 /// The footer record: sizes needed to serve HEAD and ranged GET on a
 /// multipart object without touching the client's parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,14 +133,25 @@ impl Footer {
         if trailer[0..8] != FOOTER_MAGIC {
             return Err(Error::InvalidFooter);
         }
-        Ok(u64::from_le_bytes(trailer[8..16].try_into().unwrap()))
+        let footer_len = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
+        if footer_len == 0 || footer_len > MAX_FOOTER_LEN {
+            return Err(Error::InvalidFooter);
+        }
+        Ok(footer_len)
     }
 
     /// Verify and decode a footer from its sealed frame bytes (everything
     /// before the trailer — see [`parse_trailer`](Self::parse_trailer)).
     pub fn open(alg: Alg, key: &[u8; 32], frame: &[u8]) -> Result<Self> {
         let record = open_frame(alg, key, FOOTER_PART_NUMBER, 0, true, frame)?;
-        Self::decode_record(&record)
+        let footer = Self::decode_record(&record)?;
+        // The record body names its own algorithm. It must match the one the
+        // caller opened the frame with; a disagreement means a tampered or
+        // wrong-provenance footer, not a readable object.
+        if alg != footer.alg {
+            return Err(Error::InvalidFooter);
+        }
+        Ok(footer)
     }
 }
 
@@ -203,5 +220,54 @@ impl<'a> Cursor<'a> {
             return Err(Error::InvalidFooter);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trailer_rejects_oversize_footer_len() {
+        let mut trailer = Vec::new();
+        trailer.extend_from_slice(&FOOTER_MAGIC);
+        trailer.extend_from_slice(&(MAX_FOOTER_LEN + 1).to_le_bytes());
+        assert_eq!(Footer::parse_trailer(&trailer), Err(Error::InvalidFooter));
+    }
+
+    #[test]
+    fn parse_trailer_rejects_zero_footer_len() {
+        let mut trailer = Vec::new();
+        trailer.extend_from_slice(&FOOTER_MAGIC);
+        trailer.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(Footer::parse_trailer(&trailer), Err(Error::InvalidFooter));
+    }
+
+    #[test]
+    fn parse_trailer_accepts_in_bound_footer_len() {
+        let mut trailer = Vec::new();
+        trailer.extend_from_slice(&FOOTER_MAGIC);
+        trailer.extend_from_slice(&4096u64.to_le_bytes());
+        assert_eq!(Footer::parse_trailer(&trailer), Ok(4096));
+    }
+
+    #[test]
+    fn open_rejects_alg_mismatch_between_frame_and_record() {
+        let key = [7u8; 32];
+        // The record body names XChaCha, but the frame is sealed and opened
+        // as Aes with a matching AAD, so only the body-vs-caller alg check
+        // can catch the disagreement.
+        let footer = Footer {
+            alg: Alg::XChaCha20Poly1305,
+            parts: vec![],
+            total_pt: 0,
+            md5: None,
+        };
+        let record = footer.encode_record();
+        let frame = seal_frame(Alg::Aes256Gcm, &key, FOOTER_PART_NUMBER, 0, true, &record);
+        assert_eq!(
+            Footer::open(Alg::Aes256Gcm, &key, &frame),
+            Err(Error::InvalidFooter),
+        );
     }
 }

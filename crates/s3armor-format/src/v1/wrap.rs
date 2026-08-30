@@ -5,16 +5,18 @@ use aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use aes_gcm::Aes256Gcm;
 use hkdf::Hkdf;
 use rsa::{
-    pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
+    pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey, LineEnding},
+    traits::PublicKeyParts,
     Oaep, RsaPrivateKey, RsaPublicKey,
 };
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A 32-byte master key. The KEK and key id are both derived from it via
-/// HKDF, never published directly — a raw `SHA-256(key)` fingerprint would
-/// give an offline attacker something to guess against; this gives them
-/// nothing.
+/// HKDF with separate `info` strings, so the published key id and the KEK
+/// stay in different domains: knowing the id tells an attacker nothing about
+/// the KEK. The id gives no offline advantage regardless, because the master
+/// key is 32 random bytes and cannot be guessed.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct MasterKey([u8; 32]);
 
@@ -176,20 +178,6 @@ impl RsaKek {
         Ok(Self::from_public(public))
     }
 
-    /// PKCS#8 PEM of the private key — `None` on a write-only (public-only)
-    /// node. Carries the same "the key is the data" weight as
-    /// `MasterKey`'s base64 line; callers print the wallet warning
-    /// alongside it.
-    pub fn private_pem(&self) -> Result<Option<String>> {
-        let Some(private) = &self.private else {
-            return Ok(None);
-        };
-        let doc = private
-            .to_pkcs8_pem(LineEnding::LF)
-            .map_err(|_| Error::UnwrapFailed)?;
-        Ok(Some(doc.to_string()))
-    }
-
     /// SPKI PEM of the public key — always available, the snippet a
     /// write-only ingestion node is configured with.
     pub fn public_pem(&self) -> Result<String> {
@@ -201,6 +189,16 @@ impl RsaKek {
     /// `true` for a read/full node (holds the private key).
     pub const fn can_read(&self) -> bool {
         self.private.is_some()
+    }
+
+    /// Modulus size in bits. The config loader rejects a key too small for
+    /// OAEP-SHA256, which a healthy-looking but unusable key would otherwise
+    /// pass at startup and fail on every wrap at request time.
+    pub fn modulus_bits(&self) -> usize {
+        // `size()` is the modulus length in bytes, rounded up to a byte; ×8
+        // is close enough for a "too small" gate and avoids `bits()` return
+        // type variance across rsa versions.
+        self.public.size() * 8
     }
 
     /// `hex(SHA-256(SPKI DER)[..8])` — public material, so a hash is fine

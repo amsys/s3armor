@@ -169,14 +169,17 @@ async fn probe_object(
     bucket: &str,
     key: &str,
     size: usize,
-) -> BackendResult {
+) -> Result<BackendResult, String> {
     let path = format!("/{bucket}/{}", encode_key_for_path(key));
     let payload = Bytes::from(vec![0x33u8; size]);
 
     let mut headers = Vec::new();
     set_header(&mut headers, "content-length", &size.to_string());
     let t_put = Instant::now();
-    let _ = forward(
+    // Check the status: a fast rejection (e.g. 403 on an unwritable bucket)
+    // is not throughput. Timing it and reporting it as GiB/s would give a
+    // huge, meaningless number and skew concurrency discovery too.
+    let put = forward(
         state,
         backend,
         "PUT",
@@ -185,14 +188,26 @@ async fn probe_object(
         headers,
         body::full(payload),
     )
-    .await;
+    .await
+    .map_err(|e| format!("PUT probe failed: {e}"))?;
+    if !put.status().is_success() {
+        return Err(format!("PUT probe returned {}", put.status()));
+    }
     let put_secs = t_put.elapsed().as_secs_f64();
 
     let t_get = Instant::now();
     let resp = forward(state, backend, "GET", &path, "", Vec::new(), body::empty()).await;
     let ttfb = t_get.elapsed();
-    if let Ok(resp) = resp {
-        let _ = resp.into_body().collect().await;
+    let get_status = match resp {
+        Ok(resp) => {
+            let status = resp.status();
+            let _ = resp.into_body().collect().await;
+            status
+        }
+        Err(e) => return Err(format!("GET probe failed: {e}")),
+    };
+    if !get_status.is_success() {
+        return Err(format!("GET probe returned {get_status}"));
     }
     let get_secs = t_get.elapsed().as_secs_f64();
 
@@ -208,12 +223,12 @@ async fn probe_object(
     .await;
 
     let gib = size as f64 / (1024.0 * 1024.0 * 1024.0);
-    BackendResult {
+    Ok(BackendResult {
         size,
         ttfb,
         put_gib_s: gib / put_secs.max(f64::EPSILON),
         get_gib_s: gib / get_secs.max(f64::EPSILON),
-    }
+    })
 }
 
 /// TTFB + throughput across a size ladder, direct to the configured
@@ -223,14 +238,14 @@ pub async fn run_backend(
     state: &ProxyState,
     backend: &Backend,
     bucket: &str,
-) -> Vec<BackendResult> {
+) -> Result<Vec<BackendResult>, String> {
     let prefix = format!("s3a-bench-{:x}", std::process::id());
     let mut out = Vec::with_capacity(SIZE_LADDER.len());
     for (i, &size) in SIZE_LADDER.iter().enumerate() {
         let key = format!("{prefix}/ladder-{i}");
-        out.push(probe_object(state, backend, bucket, &key, size).await);
+        out.push(probe_object(state, backend, bucket, &key, size).await?);
     }
-    out
+    Ok(out)
 }
 
 pub fn print_backend(results: &[BackendResult]) {
@@ -318,12 +333,14 @@ pub async fn part_size_sweep(
                 )
                 .await
                 {
-                    let etag = crate::proxy::headers::to_pairs(resp.headers())
-                        .into_iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
-                        .map(|(_, v)| v)
-                        .unwrap_or_default();
-                    etags.push((part as u32, etag));
+                    if resp.status().is_success() {
+                        let etag = crate::proxy::headers::to_pairs(resp.headers())
+                            .into_iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                            .map(|(_, v)| v)
+                            .unwrap_or_default();
+                        etags.push((part as u32, etag));
+                    }
                 }
             }
             let complete_xml = build_complete_xml(&etags);
@@ -342,6 +359,19 @@ pub async fn part_size_sweep(
                 &complete_query,
                 complete_headers,
                 body::full(Bytes::from(complete_xml)),
+            )
+            .await;
+            // Abort the upload too. If Complete did not succeed, the plain
+            // object DELETE below does not remove the uploaded parts; aborting
+            // a completed upload is a harmless no-op.
+            let _ = forward(
+                state,
+                backend,
+                "DELETE",
+                &path,
+                &complete_query,
+                Vec::new(),
+                body::empty(),
             )
             .await;
         }
@@ -408,7 +438,7 @@ pub async fn discover_concurrency(state: &ProxyState, backend: &Backend, bucket:
     let baseline = {
         let key = format!("{prefix}/baseline");
         let start = Instant::now();
-        probe_object(state, backend, bucket, &key, OBJECT_SIZE).await;
+        let _ = probe_object(state, backend, bucket, &key, OBJECT_SIZE).await;
         start.elapsed()
     };
 
@@ -517,8 +547,64 @@ pub async fn run_proxy_vs_direct(
         let payload = vec![0x55u8; size];
         let expected = Sha256::digest(&payload);
 
+        let gib = size as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        // Time the direct path over the same PUT+GET+DELETE the proxy path
+        // runs below, so the ratio compares like with like. A PUT-only direct
+        // number against a put+get+delete proxy number understated the proxy
+        // by 2-3x.
         let direct_key = format!("{prefix}/direct-{i}");
-        let direct = probe_object(state, backend, bucket, &direct_key, size).await;
+        let direct_path = format!("/{bucket}/{}", encode_key_for_path(&direct_key));
+        let dstart = Instant::now();
+        let mut dheaders = Vec::new();
+        set_header(&mut dheaders, "content-length", &size.to_string());
+        let dput = forward(
+            state,
+            backend,
+            "PUT",
+            &direct_path,
+            "",
+            dheaders,
+            body::full(Bytes::from(payload.clone())),
+        )
+        .await;
+        // The GET's status matters too: a failed GET transfers no body, so
+        // its (fast) elapsed time would inflate the direct number.
+        let dget_ok = match forward(
+            state,
+            backend,
+            "GET",
+            &direct_path,
+            "",
+            Vec::new(),
+            body::empty(),
+        )
+        .await
+        {
+            Ok(r) => {
+                let ok = r.status().is_success();
+                let _ = r.into_body().collect().await;
+                ok
+            }
+            Err(_) => false,
+        };
+        let _ = forward(
+            state,
+            backend,
+            "DELETE",
+            &direct_path,
+            "",
+            Vec::new(),
+            body::empty(),
+        )
+        .await;
+        let direct_secs = dstart.elapsed().as_secs_f64();
+        let direct_ok = dput.is_ok_and(|r| r.status().is_success()) && dget_ok;
+        let direct_gib_s = if direct_ok {
+            gib / direct_secs.max(f64::EPSILON)
+        } else {
+            0.0
+        };
 
         let proxy_key = format!("{prefix}/proxy-{i}");
         let t = Instant::now();
@@ -526,12 +612,11 @@ pub async fn run_proxy_vs_direct(
             .put_get_delete(bucket, &proxy_key, &payload)
             .await;
         let proxy_secs = t.elapsed().as_secs_f64();
-        let gib = size as f64 / (1024.0 * 1024.0 * 1024.0);
         let verified = got.as_deref().map(Sha256::digest).as_deref() == Some(expected.as_slice());
 
         out.push(ProxyVsDirectResult {
             size,
-            direct_gib_s: direct.put_gib_s,
+            direct_gib_s,
             proxy_gib_s: gib / proxy_secs.max(f64::EPSILON),
             verified,
         });

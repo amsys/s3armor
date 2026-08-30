@@ -74,6 +74,24 @@ struct Resolved {
 
 /// Reads `NAME` directly or `NAME_FILE` (file contents, trailing
 /// `\r`/`\n` stripped). Both set is an error. Neither set returns `None`.
+/// Warns (does not fail) when a secret file is readable by group or other. A
+/// bind-mounted secret's mode is not always under the operator's control, so
+/// this stays advisory. tracing is not up at config-load time, so the warning
+/// goes to stderr.
+fn warn_if_group_or_other_readable(path: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "s3armor: warning: secret file {path} is accessible by group/other (mode {:o}); \
+                 tighten to 0600 where the mount allows it",
+                mode & 0o777
+            );
+        }
+    }
+}
+
 fn read_var(env: &dyn EnvSource, name: &str) -> Result<Option<Resolved>, ConfigError> {
     let plain = env.get(name);
     let file_var = format!("{name}_FILE");
@@ -87,6 +105,7 @@ fn read_var(env: &dyn EnvSource, name: &str) -> Result<Option<Resolved>, ConfigE
         (None, Some(path)) => {
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| ConfigError::FileRead(name.to_string(), path.clone(), e))?;
+            warn_if_group_or_other_readable(&path);
             let trimmed = raw.trim_end_matches(['\r', '\n']).to_string();
             Ok(Some(Resolved {
                 source: Source::EnvFile(path),
@@ -532,7 +551,13 @@ impl Config {
     pub fn print_effective(&self) {
         for (name, source) in &self.sources {
             let display = if is_secret(name) {
-                "<redacted>".to_string()
+                // Distinguish an unset secret from a configured one: printing
+                // `<redacted>` for an absent value reads as "it is set".
+                if matches!(source, Source::Default) {
+                    "<unset>".to_string()
+                } else {
+                    "<redacted>".to_string()
+                }
             } else {
                 self.raw_value(name)
             };
@@ -674,16 +699,24 @@ fn parse_duration(raw: &str, name: &'static str) -> Result<Duration, ConfigError
     if let Ok(secs) = raw.parse::<u64>() {
         return Ok(Duration::from_secs(secs));
     }
-    let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));
-    let n: u64 = digits.parse().map_err(|_| invalid())?;
-    let mul = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        _ => return Err(invalid()),
+    // Match the unit as a char, not a byte: `raw.split_at(len-1)` panics on a
+    // multi-byte trailing char (e.g. a pasted non-breaking space).
+    let (digits, mul): (&str, u64) = if let Some(d) = raw.strip_suffix('s') {
+        (d, 1)
+    } else if let Some(d) = raw.strip_suffix('m') {
+        (d, 60)
+    } else if let Some(d) = raw.strip_suffix('h') {
+        (d, 3600)
+    } else if let Some(d) = raw.strip_suffix('d') {
+        (d, 86_400)
+    } else {
+        return Err(invalid());
     };
-    Ok(Duration::from_secs(n * mul))
+    let n: u64 = digits.parse().map_err(|_| invalid())?;
+    // `checked_mul`: overflow-checks are off in release, so a huge value would
+    // otherwise wrap silently instead of being rejected.
+    let secs = n.checked_mul(mul).ok_or_else(invalid)?;
+    Ok(Duration::from_secs(secs))
 }
 
 /// Plain paths, not `read_var`'s NAME/NAME_FILE convention — see the field
@@ -693,12 +726,26 @@ fn parse_tls(
     env: &dyn EnvSource,
     sources: &mut BTreeMap<String, Source>,
 ) -> Result<Option<TlsConfig>, ConfigError> {
+    // TLS cert/key are file PATHS handed to rustls, not secret values, so the
+    // NAME_FILE convention does not apply. A `_FILE` variant that an operator
+    // set expecting it to work would otherwise be silently ignored, leaving
+    // the proxy serving plaintext on the S3 port. Reject it loudly.
+    for name in ["S3A_TLS_CERT_FILE", "S3A_TLS_KEY_FILE"] {
+        if env.get(name).is_some() {
+            return Err(ConfigError::Invalid(
+                name,
+                "TLS uses S3A_TLS_CERT / S3A_TLS_KEY (paths to the PEM files), not the _FILE \
+                 convention"
+                    .to_string(),
+            ));
+        }
+    }
     let tls_cert = env.get("S3A_TLS_CERT");
     let tls_key = env.get("S3A_TLS_KEY");
     match (tls_cert, tls_key) {
         (Some(cert_path), Some(key_path)) => {
-            sources.insert("S3A_TLS_CERT".to_string(), Source::Env);
-            sources.insert("S3A_TLS_KEY".to_string(), Source::Env);
+            sources.insert("S3A_TLS_CERT".to_string(), env.origin("S3A_TLS_CERT"));
+            sources.insert("S3A_TLS_KEY".to_string(), env.origin("S3A_TLS_KEY"));
             Ok(Some(TlsConfig {
                 cert_path,
                 key_path,
@@ -743,7 +790,7 @@ fn discover_names(
     prefix: &str,
     suffixes: &[&str],
     exclude: &[&str],
-) -> std::collections::BTreeSet<String> {
+) -> Result<std::collections::BTreeSet<String>, ConfigError> {
     let mut names = std::collections::BTreeSet::new();
     for var in env.names() {
         let Some(rest) = var.strip_prefix(prefix) else {
@@ -755,13 +802,24 @@ fn discover_names(
         }
         for suffix in suffixes {
             if let Some(name) = rest.strip_suffix(suffix) {
-                if is_valid_name(name) {
-                    names.insert(name.to_string());
+                // A var that carries a known suffix is a named entry. If its
+                // <NAME> segment breaks the rule, that is a startup error, not
+                // something to skip silently — a skipped client just 403s
+                // every request later with no diagnostic.
+                if !is_valid_name(name) {
+                    return Err(ConfigError::Invalid(
+                        "S3A_<NAME>",
+                        format!(
+                            "{var}: the <NAME> segment must be uppercase letters and digits only, \
+                             with no underscores"
+                        ),
+                    ));
                 }
+                names.insert(name.to_string());
             }
         }
     }
-    names
+    Ok(names)
 }
 
 fn is_valid_name(s: &str) -> bool {
@@ -777,7 +835,7 @@ fn load_clients(
     env: &dyn EnvSource,
     sources: &mut BTreeMap<String, Source>,
 ) -> Result<BTreeMap<String, ClientCredentials>, ConfigError> {
-    let names = discover_names(env, "S3A_CLIENT_", &["_ACCESS_KEY", "_SECRET_KEY"], &[]);
+    let names = discover_names(env, "S3A_CLIENT_", &["_ACCESS_KEY", "_SECRET_KEY"], &[])?;
 
     let mut clients = BTreeMap::new();
     for name in names {
@@ -831,7 +889,7 @@ fn load_backends(
         "S3A_BACKEND_",
         &["_ENDPOINT", "_REGION", "_ACCESS_KEY", "_SECRET_KEY"],
         &DEFAULT_SUFFIXES,
-    );
+    )?;
 
     let mut backends = BTreeMap::new();
 
@@ -939,13 +997,19 @@ fn load_keys(
             if name == "ACTIVE" {
                 continue;
             }
-            if !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-            {
-                names.insert(name.to_string());
+            // An invalid key name is a startup error, not a silent skip: a
+            // dropped key means every object it wrote later fails to decrypt
+            // with no diagnostic.
+            if !is_valid_name(name) {
+                return Err(ConfigError::Invalid(
+                    "S3A_KEY_<NAME>",
+                    format!(
+                        "{var}: the <NAME> segment must be uppercase letters and digits only, \
+                         with no underscores"
+                    ),
+                ));
             }
+            names.insert(name.to_string());
         }
     }
 
@@ -1007,18 +1071,42 @@ fn load_rsa_kek(
         (Some(_), Some(_)) => Err(ConfigError::BothSetPair("S3A_RSA_KEY", "S3A_RSA_PUBLIC")),
         (Some(r), None) => {
             sources.insert("S3A_RSA_KEY".to_string(), r.source);
-            RsaKek::from_private_pem(&r.value)
-                .map(Some)
-                .map_err(|e| ConfigError::Invalid("S3A_RSA_KEY", e.to_string()))
+            let kek = RsaKek::from_private_pem(&r.value).map_err(|_| {
+                // Every parse failure maps to one internal error, so give the
+                // real cause here rather than the misleading "unwrap failed".
+                ConfigError::Invalid(
+                    "S3A_RSA_KEY",
+                    "not a PKCS#8 PEM private key — `openssl pkcs8 -topk8` converts a PKCS#1 key"
+                        .to_string(),
+                )
+            })?;
+            check_rsa_modulus(&kek, "S3A_RSA_KEY")?;
+            Ok(Some(kek))
         }
         (None, Some(r)) => {
             sources.insert("S3A_RSA_PUBLIC".to_string(), r.source);
-            RsaKek::from_public_pem(&r.value)
-                .map(Some)
-                .map_err(|e| ConfigError::Invalid("S3A_RSA_PUBLIC", e.to_string()))
+            let kek = RsaKek::from_public_pem(&r.value)
+                .map_err(|e| ConfigError::Invalid("S3A_RSA_PUBLIC", e.to_string()))?;
+            check_rsa_modulus(&kek, "S3A_RSA_PUBLIC")?;
+            Ok(Some(kek))
         }
         (None, None) => Ok(None),
     }
+}
+
+/// Rejects an RSA key whose modulus is too small for OAEP-SHA256. A small key
+/// loads and reports a healthy "read+write" node, then fails every wrap at
+/// request time; catch it at startup instead. docs/ARCHITECTURE.md specifies
+/// 4096 bits; 2048 is the floor.
+fn check_rsa_modulus(kek: &RsaKek, name: &'static str) -> Result<(), ConfigError> {
+    let bits = kek.modulus_bits();
+    if bits < 2048 {
+        return Err(ConfigError::Invalid(
+            name,
+            format!("RSA modulus is {bits} bits; at least 2048 is required (4096 recommended)"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -129,6 +129,16 @@ pub async fn rewrap(state: Arc<ProxyState>, args: RewrapArgs) -> Result<RewrapRe
     let dry_run = args.dry_run;
     let workers = args.workers.max(1);
 
+    // rewrap re-wraps under the current binding mode. Under `on`/`strict` this
+    // also binds objects that had no binding before; a later revert to `off`
+    // would then leave them undecryptable. Warn loudly so the operator knows.
+    if state.config.bind_mode != crate::config::BindMode::Off {
+        eprintln!(
+            "warning: S3A_BIND_PATHS is not 'off' — this rewrap also path-binds each object; \
+             reverting to 'off' afterwards would make them unreadable"
+        );
+    }
+
     let results: Vec<(String, Result<Outcome, String>)> = stream::iter(objects)
         .map(|o| {
             let state = state.clone();
@@ -140,7 +150,11 @@ pub async fn rewrap(state: Arc<ProxyState>, args: RewrapArgs) -> Result<RewrapRe
                 let outcome = rewrap_one(&state, &backend, &bucket, &o.key, dry_run).await;
                 if outcome.is_ok() && !dry_run {
                     let mut cp = checkpoint.lock().await;
-                    let _ = cp.mark_done(&key);
+                    if let Err(e) = cp.mark_done(&key) {
+                        // A dropped checkpoint write makes a resumed run redo
+                        // this key silently. Surface it rather than hide it.
+                        eprintln!("warning: checkpoint write failed for {key}: {e}");
+                    }
                 }
                 (key, outcome.map_err(|e| e.to_string()))
             }
@@ -166,6 +180,29 @@ fn header_owned(pairs: &[(String, String)], name: &str) -> Option<String> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.clone())
+}
+
+/// System headers S3 takes from the request under `metadata-directive:
+/// REPLACE` and defaults if absent. A metadata-only rewrap/rebind copy must
+/// carry each one that the source object had, or it silently loses them.
+const PRESERVED_SYSTEM_HEADERS: [&str; 6] = [
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "expires",
+    "x-amz-storage-class",
+];
+
+fn preserve_system_headers(
+    head_headers: &[(String, String)],
+    copy_headers: &mut Vec<(String, String)>,
+) {
+    for name in PRESERVED_SYSTEM_HEADERS {
+        if let Some(v) = header_owned(head_headers, name) {
+            set_header(copy_headers, name, &v);
+        }
+    }
 }
 
 async fn rewrap_one(
@@ -195,12 +232,15 @@ async fn rewrap_one(
     if meta.kid == active_kid {
         return Ok(Outcome::AlreadyActive);
     }
+    let dek = crate::intercept::resolve_key_for(state, &meta, bucket, key.as_bytes())
+        .map_err(|_| ToolError::Backend(format!("old key {} is not configured", meta.kid)))?;
+    // Check key availability before returning for a dry run: the old key being
+    // unconfigured is the failure most likely to affect a real run, so a dry
+    // run that skipped this check would report success and then fail on every
+    // object.
     if dry_run {
         return Ok(Outcome::Rewrapped);
     }
-
-    let dek = crate::intercept::resolve_key_for(state, &meta, bucket, key.as_bytes())
-        .map_err(|_| ToolError::Backend(format!("old key {} is not configured", meta.kid)))?;
     let binding = crate::intercept::binding_for(state, bucket, key.as_bytes());
     let (new_kek, new_kid, wrapped_dek) = state.config.keyring.wrap_active(&dek, &binding)?;
 
@@ -228,6 +268,11 @@ async fn rewrap_one(
     if let Some(ct) = &content_type {
         set_header(&mut copy_headers, "content-type", ct);
     }
+    // With metadata-directive: REPLACE the backend takes every system header
+    // from the request and defaults any that is absent. Carry them from the
+    // source HEAD so this copy does not strip Content-Encoding or cache
+    // headers, or reset the storage class to STANDARD.
+    preserve_system_headers(&head_headers, &mut copy_headers);
     for (k, v) in &preserved {
         set_header(&mut copy_headers, k, v);
     }
@@ -375,7 +420,11 @@ pub async fn rebind(state: Arc<ProxyState>, args: RebindArgs) -> Result<RebindRe
                 .await;
                 if outcome.is_ok() && !dry_run {
                     let mut cp = checkpoint.lock().await;
-                    let _ = cp.mark_done(&key);
+                    if let Err(e) = cp.mark_done(&key) {
+                        // A dropped checkpoint write makes a resumed run redo
+                        // this key silently. Surface it rather than hide it.
+                        eprintln!("warning: checkpoint write failed for {key}: {e}");
+                    }
                 }
                 (key, outcome.map_err(|e| e.to_string()))
             }
@@ -485,6 +534,11 @@ async fn rebind_one(
     if let Some(ct) = &content_type {
         set_header(&mut copy_headers, "content-type", ct);
     }
+    // With metadata-directive: REPLACE the backend takes every system header
+    // from the request and defaults any that is absent. Carry them from the
+    // source HEAD so this copy does not strip Content-Encoding or cache
+    // headers, or reset the storage class to STANDARD.
+    preserve_system_headers(&head_headers, &mut copy_headers);
     for (k, v) in &preserved {
         set_header(&mut copy_headers, k, v);
     }

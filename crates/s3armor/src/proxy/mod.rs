@@ -638,12 +638,17 @@ pub(crate) async fn forward(
     mut outbound_headers: Vec<(String, String)>,
     outbound_body: ProxyBody,
 ) -> Result<Response<Incoming>, S3Error> {
+    // Backend endpoint and name are deployment-internal. Log the detail
+    // server-side (the request span carries the correlation id) and return a
+    // fixed message, so a client never sees the backend topology.
     let backend_uri: Uri = backend.endpoint.parse().map_err(|e| {
-        S3Error::bad_gateway(format!("invalid backend endpoint {}: {e}", backend.name))
+        tracing::error!(backend = %backend.name, error = %e, "invalid backend endpoint");
+        S3Error::bad_gateway("upstream endpoint is misconfigured".to_string())
     })?;
-    let backend_authority = backend_uri
-        .authority()
-        .ok_or_else(|| S3Error::bad_gateway(format!("backend {} has no host", backend.name)))?;
+    let backend_authority = backend_uri.authority().ok_or_else(|| {
+        tracing::error!(backend = %backend.name, "backend endpoint has no host");
+        S3Error::bad_gateway("upstream endpoint is misconfigured".to_string())
+    })?;
     set_header(&mut outbound_headers, "host", backend_authority.as_str());
 
     let amz_date = sigv4::time::format_amz_date(SystemTime::now());
@@ -721,7 +726,12 @@ pub(crate) async fn forward(
     .await
     {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(S3Error::bad_gateway(format!("backend request failed: {e}"))),
+        Ok(Err(e)) => {
+            // The transport error is a per-request internal detail; log it,
+            // return a fixed message.
+            tracing::error!(backend = %backend.name, error = %e, "backend request failed");
+            Err(S3Error::bad_gateway("upstream request failed".to_string()))
+        }
         Err(_) => Err(S3Error::gateway_timeout(format!(
             "backend did not respond within {:?} (S3A_TIMEOUT_REQUEST)",
             state.config.timeout_request

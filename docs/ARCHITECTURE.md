@@ -156,8 +156,10 @@ Two key providers exist, named by `s3a-kek` in object metadata:
   of silently producing garbage.
   - KEK = HKDF-SHA256(master_key, info=`"s3a/v1/kek"`).
   - key_id = hex(first 8 bytes of HKDF(master_key, info=`"s3a/v1/kid"`)).
-    The key id is derived, not a hash of the raw key. An attacker cannot use
-    a published key id as an oracle to test guessed keys offline.
+    The KEK and the key id use separate HKDF `info` strings, so they stay in
+    different domains: a published key id reveals nothing about the KEK. The
+    id gives no offline advantage in any case, because the master key is 32
+    random bytes and cannot be guessed.
 - **`rsa`** — kept for write-only ingestion nodes. The proxy wraps the DEK
   with RSA-OAEP-SHA256. key_id = hex(first 8 bytes of SHA-256 of the SPKI
   DER encoding); a hash is safe here because the public key is not secret.

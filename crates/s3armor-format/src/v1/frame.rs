@@ -155,7 +155,13 @@ pub fn plaintext_len(alg: Alg, ct_len: u64, chunk_size: u64) -> Result<u64> {
     // encoder used.
     let n_minus_1 = (ct_len - overhead) / full;
     let last = ct_len - n_minus_1 * full;
-    if last < overhead || last > full {
+    // `last == overhead` means a final frame with zero plaintext bytes. Only
+    // an empty object encodes that way, and an empty object is a single
+    // frame (`n_minus_1 == 0`). With earlier frames present, `last ==
+    // overhead` is a truncation no encoder produces, so reject it — else a
+    // ciphertext cut to `k*full + overhead` would report `k*chunk_size`
+    // plaintext and stream short under a satisfied Content-Length.
+    if last < overhead || last > full || (last == overhead && n_minus_1 > 0) {
         return Err(Error::InvalidLength);
     }
     Ok(n_minus_1 * chunk_size + (last - overhead))
@@ -246,6 +252,13 @@ pub struct Encryptor {
 impl Encryptor {
     pub fn new(alg: Alg, key: [u8; 32], part_number: u32, chunk_size: usize) -> Self {
         assert!(chunk_size > 0, "chunk_size must be positive");
+        // u32::MAX is reserved for the footer frame (see footer.rs). A caller
+        // must reject an out-of-range client part number at its own trust
+        // boundary; this belt stops a footer-forgery frame if one slips past.
+        debug_assert!(
+            part_number != u32::MAX,
+            "part_number u32::MAX is reserved for the footer frame"
+        );
         Self {
             alg,
             key,

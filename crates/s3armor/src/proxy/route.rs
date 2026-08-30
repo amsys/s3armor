@@ -114,7 +114,11 @@ fn classify_mpu(method: &str, raw_query: &str, has_copy_source: bool) -> Option<
     if !has_uploads && !has_upload_id && !has_part_number {
         return None;
     }
-    if has_upload_id && has_part_number {
+    // UploadPart / UploadPartCopy are PUTs. Gate on the method so a GET
+    // carrying uploadId+partNumber is never routed into the part-upload
+    // handler (which hardcodes PUT and would overwrite the part with an empty
+    // body); it falls through to a passthrough instead.
+    if has_upload_id && has_part_number && method == "PUT" {
         return Some(if has_copy_source {
             MpuOp::UploadPartCopy
         } else {

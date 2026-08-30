@@ -47,6 +47,13 @@ pub async fn handle(
     }
     match header_value(&outbound_headers, "range").and_then(parse_byte_range) {
         None => {
+            // No range, or a range this proxy cannot parse (e.g. a
+            // multi-range). Either way serve the whole object — and strip the
+            // range header so the backend returns 200 with full ciphertext.
+            // Forwarding an unparseable range would make the backend answer
+            // 206 with a partial body, which then fails AEAD and wrongly trips
+            // the chunk-verify-failure metric.
+            outbound_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("range"));
             handle_full(
                 state,
                 backend,
@@ -423,7 +430,13 @@ fn resolve_range(range: (Option<u64>, Option<u64>), pt_len: u64) -> (u64, u64) {
     match range {
         (Some(start), Some(end_inclusive)) => {
             let start = start.min(pt_len);
-            (start, (end_inclusive + 1).min(pt_len).max(start))
+            // saturating_add: `bytes=0-18446744073709551615` would otherwise
+            // wrap to 0 (overflow-checks are off in release) and return an
+            // empty 206 instead of the object.
+            (
+                start,
+                end_inclusive.saturating_add(1).min(pt_len).max(start),
+            )
         }
         (Some(start), None) => (start.min(pt_len), pt_len),
         (None, Some(suffix)) => (pt_len.saturating_sub(suffix), pt_len),

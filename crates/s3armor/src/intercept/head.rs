@@ -26,6 +26,10 @@ pub async fn handle(
     request_id: &str,
 ) -> Result<Response<ProxyBody>, S3Error> {
     let conds = Conditionals::take(&mut outbound_headers);
+    // Strip any Range header: a HEAD carrying it makes the backend report a
+    // partial Content-Length, which the plaintext-size fixup below would then
+    // compute from. HEAD reports the whole object's size.
+    outbound_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("range"));
     let backend_resp = forward(
         state,
         backend,

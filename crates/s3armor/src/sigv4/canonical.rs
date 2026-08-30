@@ -18,7 +18,7 @@
 //! request target, and use RFC 3986 path encoding, never form encoding.
 
 use hmac::{Hmac, Mac};
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{percent_decode_str, percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use sha2::{Digest, Sha256};
 
 /// RFC 3986 unreserved set: `A-Za-z0-9-._~`. Everything else — including
@@ -33,16 +33,12 @@ const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 fn encode_component(bytes: &[u8]) -> String {
-    // percent_encoding operates on &str; our inputs are either already str
-    // or raw bytes reinterpreted losslessly — see callers.
-    utf8_percent_encode(
-        // SAFETY-free: we only ever feed this valid UTF-8 (str inputs, or
-        // bytes produced by percent-decoding a str, which percent_decode's
-        // caller below re-validates via from_utf8_lossy).
-        std::str::from_utf8(bytes).unwrap_or_default(),
-        UNRESERVED,
-    )
-    .to_string()
+    // Encode the raw bytes directly. A byte that is not in the unreserved
+    // set becomes %XX, invalid-UTF-8 bytes included. Going through `str`
+    // first would drop an undecodable segment to the empty string, so
+    // `/a%FFb` and `/x%FFy` would both canonicalize to `/` and a captured
+    // signature would stop binding the object key.
+    percent_encode(bytes, UNRESERVED).to_string()
 }
 
 /// Path normalization, operating on the raw path string so `.`/`..` and
@@ -117,17 +113,16 @@ pub fn canonical_query(raw_query: &str, exclude: &[&str]) -> String {
         .filter(|p| !p.is_empty())
         .map(|pair| {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let dk = percent_decode_str(k).decode_utf8_lossy().into_owned();
-            let dv = percent_decode_str(v).decode_utf8_lossy().into_owned();
-            (dk, dv)
-        })
-        .filter(|(k, _)| !exclude.contains(&k.as_str()))
-        .map(|(k, v)| {
+            // Decode to raw bytes, not lossy UTF-8: `%FF`, `%FE` and a
+            // literal U+FFFD must stay distinct canonical values, not
+            // collapse onto one.
             (
-                encode_component(k.as_bytes()),
-                encode_component(v.as_bytes()),
+                percent_decode_str(k).collect::<Vec<u8>>(),
+                percent_decode_str(v).collect::<Vec<u8>>(),
             )
         })
+        .filter(|(k, _)| !exclude.iter().any(|e| e.as_bytes() == k.as_slice()))
+        .map(|(k, v)| (encode_component(&k), encode_component(&v)))
         .collect();
     pairs.sort();
     pairs
@@ -278,6 +273,18 @@ mod tests {
     fn utf8_gets_byte_encoded() {
         // The vendored `get-utf8` case: raw path is one Ethiopic character.
         assert_eq!(canonical_uri("/ሴ", true, true), "/%E1%88%B4");
+    }
+
+    #[test]
+    fn invalid_utf8_escapes_stay_distinct() {
+        // An invalid-UTF-8 percent escape must survive as %XX, so different
+        // keys stay different canonical URIs and a signature keeps binding
+        // the real key — not collapse to `/`.
+        let a = canonical_uri("/a%FFb", false, true);
+        let b = canonical_uri("/x%FFy", false, true);
+        assert_ne!(a, b);
+        assert_ne!(a, "/");
+        assert_eq!(a, "/a%FFb");
     }
 
     #[test]

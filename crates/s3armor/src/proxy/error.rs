@@ -243,6 +243,7 @@ impl From<VerifyError> for S3Error {
             | VerifyError::BadSignedHeaders(_)
             | VerifyError::BadScope
             | VerifyError::BadExpires
+            | VerifyError::UnsignedAmzHeader(_)
             | VerifyError::MissingHeader(_) => Self::access_denied(e.to_string()),
             VerifyError::UnknownAccessKey => Self::invalid_access_key(),
             VerifyError::ClockSkew | VerifyError::DateMismatch => Self::request_time_too_skewed(),

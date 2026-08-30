@@ -43,6 +43,16 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 /// declaring — and sending — one enormous chunk.
 const MAX_DECLARED_CHUNK: usize = 64 * 1024 * 1024;
 
+/// Largest chunk-size or trailer line this decoder buffers before it must
+/// see a CRLF. Real headers and trailers are tiny. This stops an
+/// unterminated line from growing `buf` without bound — and, because the
+/// pending line stays small, keeps the per-feed CRLF scan bounded too.
+const MAX_LINE_BYTES: usize = 8 * 1024;
+
+/// Largest number of trailer lines retained. The trailing checksum is the
+/// only trailer a client sends; nothing reads more than a handful.
+const MAX_TRAILERS: usize = 32;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ChunkedError {
     #[error("malformed chunk header")]
@@ -199,6 +209,9 @@ impl Dechunker {
     )]
     fn step_header(&mut self, out: &mut Vec<DecodedChunk>) -> Result<bool, ChunkedError> {
         let Some(pos) = find_crlf(&self.buf) else {
+            if self.buf.len() > MAX_LINE_BYTES {
+                return Err(ChunkedError::MalformedHeader);
+            }
             return Ok(false);
         };
         let line =
@@ -206,10 +219,13 @@ impl Dechunker {
         let (size, signature) = parse_chunk_header(line)?;
         self.buf.drain(..pos + 2);
         if size == 0 {
+            // Emit the terminating zero-length chunk whether or not it
+            // carries a signature. The caller then verifies its presence on
+            // a signed stream: an attacker who strips the signature leaves a
+            // `None` the caller rejects, instead of the stream ending
+            // silently with no terminator to check.
             self.state = State::Trailers;
-            if let Some(sig) = signature {
-                out.push((Vec::new(), Some(sig)));
-            }
+            out.push((Vec::new(), signature));
         } else {
             self.state = State::Data {
                 remaining: size,
@@ -266,13 +282,24 @@ impl Dechunker {
     )]
     fn step_trailers(&mut self) -> Result<bool, ChunkedError> {
         let Some(pos) = find_crlf(&self.buf) else {
+            if self.buf.len() > MAX_LINE_BYTES {
+                return Err(ChunkedError::MalformedTrailer);
+            }
             return Ok(false);
         };
         let line = self.buf[..pos].to_vec();
         self.buf.drain(..pos + 2);
         if line.is_empty() {
             self.state = State::Done;
+            // Nothing legitimate follows the terminating empty line inside
+            // the same body. Any residue is a framing error.
+            if !self.buf.is_empty() {
+                return Err(ChunkedError::AlreadyDone);
+            }
             return Ok(false);
+        }
+        if self.trailers.len() >= MAX_TRAILERS {
+            return Err(ChunkedError::MalformedTrailer);
         }
         let line = std::str::from_utf8(&line).map_err(|_| ChunkedError::MalformedTrailer)?;
         let (name, value) = line.split_once(':').ok_or(ChunkedError::MalformedTrailer)?;
@@ -395,6 +422,43 @@ mod tests {
         let (size, sig) = parse_chunk_header(&line).unwrap();
         assert_eq!(size, MAX_DECLARED_CHUNK);
         assert_eq!(sig, None);
+    }
+
+    #[test]
+    fn unterminated_header_line_is_bounded() {
+        let mut d = Dechunker::new();
+        // A header line that never reaches a CRLF must error once it grows
+        // past the cap, not buffer without bound.
+        let junk = vec![b'a'; MAX_LINE_BYTES + 1];
+        assert_eq!(d.feed(&junk).unwrap_err(), ChunkedError::MalformedHeader);
+    }
+
+    #[test]
+    fn too_many_trailer_lines_are_rejected() {
+        let mut d = Dechunker::new();
+        let mut wire = b"0\r\n".to_vec();
+        for _ in 0..=MAX_TRAILERS {
+            wire.extend_from_slice(b"x-a:b\r\n");
+        }
+        wire.extend_from_slice(b"\r\n");
+        assert_eq!(d.feed(&wire).unwrap_err(), ChunkedError::MalformedTrailer);
+    }
+
+    #[test]
+    fn bytes_after_the_terminator_are_rejected() {
+        let mut d = Dechunker::new();
+        let wire = b"0\r\n\r\nEXTRA";
+        assert_eq!(d.feed(wire).unwrap_err(), ChunkedError::AlreadyDone);
+    }
+
+    #[test]
+    fn unsigned_terminator_is_emitted_so_the_caller_can_check_it() {
+        let mut d = Dechunker::new();
+        // A zero-length terminator with no signature is now emitted as a
+        // chunk with `None`, so a signed-stream caller can reject it.
+        let chunks = d.feed(b"0\r\n\r\n").unwrap();
+        assert_eq!(chunks, vec![(Vec::new(), None)]);
+        assert!(d.is_done());
     }
 
     // --- signature chain ---

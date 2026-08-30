@@ -66,6 +66,20 @@ pub enum VerifyError {
     Expired,
     #[error("invalid X-Amz-Expires value")]
     BadExpires,
+    #[error("request has an x-amz-* header that is not in SignedHeaders: {0}")]
+    UnsignedAmzHeader(String),
+}
+
+/// AWS requires every `x-amz-*` request header to appear in `SignedHeaders`.
+/// `signed_names` is already lowercase (see [`validate_signed_headers`]), so
+/// an unsigned `x-amz-*` header — e.g. an `x-amz-copy-source` added to a
+/// presigned PUT that only signed `host` — is rejected instead of being
+/// forwarded to the backend and re-signed with backend credentials.
+fn unsigned_amz_header(headers: &[(String, String)], signed_names: &[String]) -> Option<String> {
+    headers.iter().find_map(|(k, _)| {
+        let lower = k.to_ascii_lowercase();
+        (lower.starts_with("x-amz-") && !signed_names.iter().any(|s| s == &lower)).then_some(lower)
+    })
 }
 
 /// `pub` (rather than the crate-internal default every other helper here
@@ -239,6 +253,9 @@ fn verify_header(
     let signature = signature.ok_or(VerifyError::MalformedAuthHeader)?;
     let signed_names = validate_signed_headers(signed_headers_raw)
         .ok_or_else(|| VerifyError::BadSignedHeaders(signed_headers_raw.to_string()))?;
+    if let Some(name) = unsigned_amz_header(headers, &signed_names) {
+        return Err(VerifyError::UnsignedAmzHeader(name));
+    }
 
     if credential.service != "s3" {
         return Err(VerifyError::BadScope);
@@ -332,9 +349,17 @@ fn verify_presigned(
         .ok_or(VerifyError::MalformedPresignedQuery)?
         .parse()
         .map_err(|_| VerifyError::BadExpires)?;
+    // Real S3 caps a presigned URL at 7 days. An unbounded lifetime turns a
+    // leaked URL (logs, referrers, history) into a near-permanent credential.
+    if expires == 0 || expires > 604_800 {
+        return Err(VerifyError::BadExpires);
+    }
 
     let signed_names = validate_signed_headers(signed_headers_raw)
         .ok_or_else(|| VerifyError::BadSignedHeaders(signed_headers_raw.clone()))?;
+    if let Some(name) = unsigned_amz_header(headers, &signed_names) {
+        return Err(VerifyError::UnsignedAmzHeader(name));
+    }
     if credential.service != "s3" {
         return Err(VerifyError::BadScope);
     }
@@ -487,6 +512,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id.access_key, "AKIDEXAMPLE");
+    }
+
+    #[test]
+    fn unsigned_amz_header_is_rejected() {
+        // Sign only host;x-amz-date, then add an unsigned x-amz-copy-source
+        // (the presigned-PUT-to-CopyObject escalation). Verification must
+        // reject it rather than forward it to the backend re-signed.
+        let headers = vec![
+            ("Host".to_string(), "example.amazonaws.com".to_string()),
+            ("X-Amz-Date".to_string(), "20150830T123600Z".to_string()),
+        ];
+        let sig = sign_for_test(
+            "PUT",
+            "/bucket/key",
+            "",
+            &headers,
+            &["host".into(), "x-amz-date".into()],
+            "UNSIGNED-PAYLOAD",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "us-east-1",
+            "s3",
+            "20150830T123600Z",
+        );
+        let mut req_headers = headers;
+        req_headers.push((
+            "x-amz-copy-source".to_string(),
+            "/other-bucket/secret".to_string(),
+        ));
+        req_headers.push((
+            "Authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature={sig}"
+            ),
+        ));
+        let err = verify(
+            "PUT",
+            "/bucket/key",
+            "",
+            &req_headers,
+            "UNSIGNED-PAYLOAD",
+            &client_map(),
+            amz_now(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, VerifyError::UnsignedAmzHeader(_)), "{err:?}");
     }
 
     #[test]

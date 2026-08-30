@@ -175,8 +175,16 @@ fn load_config_or_exit(config_path: Option<&str>) -> Config {
 /// machinery they reuse going nowhere. `try_init` rather than `init`: a
 /// second call (there is none today, but a future one) should not panic.
 fn init_tracing(config: &Config) {
-    let filter = tracing_subscriber::EnvFilter::try_new(&config.log_level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = tracing_subscriber::EnvFilter::try_new(&config.log_level).unwrap_or_else(|e| {
+        // tracing is not up yet, so a plain stderr line is the only channel to
+        // tell the operator their S3A_LOG value was rejected instead of
+        // silently applied.
+        eprintln!(
+            "s3armor: invalid S3A_LOG value {:?} ({e}); falling back to \"info\"",
+            config.log_level
+        );
+        tracing_subscriber::EnvFilter::new("info")
+    });
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
     let _ = match config.log_format {
         s3armor::config::LogFormat::Json => subscriber.json().try_init(),
@@ -257,7 +265,13 @@ async fn run_bench(args: BenchCli, config_path: Option<&str>) {
     let backend = resolve_backend_or_exit(&state, args.backend.as_deref());
 
     if args.backend_tier {
-        let results = tools::bench::run_backend(&state, backend, &bucket).await;
+        let results = match tools::bench::run_backend(&state, backend, &bucket).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("s3armor: bench backend tier aborted: {e}");
+                std::process::exit(1);
+            }
+        };
         if args.json {
             println!("{}", tools::bench::backend_json(&results));
         } else {
@@ -270,6 +284,13 @@ async fn run_bench(args: BenchCli, config_path: Option<&str>) {
     }
 
     if let Some(proxy_url) = args.proxy {
+        // The proxy client speaks plain HTTP only (no TLS connector), so a
+        // non-http:// URL would silently time failed requests and report
+        // nonsense throughput. Reject it up front.
+        if !proxy_url.starts_with("http://") {
+            eprintln!("s3armor: bench --proxy must be an http:// URL (TLS to the proxy is not supported by this probe)");
+            std::process::exit(1);
+        }
         // The proxy under test authenticates like any other S3 client —
         // reuse the first registered `S3A_CLIENT_<NAME>` credential this
         // `bench` process was configured with (the same env a real
@@ -507,6 +528,11 @@ async fn accept_loop(
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(error = %e, "accept failed");
+                        // Back off: under fd exhaustion (EMFILE/ENFILE) accept
+                        // returns an error immediately and repeatedly, which
+                        // would otherwise spin the loop at 100% CPU and flood
+                        // the log.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
@@ -633,6 +659,8 @@ async fn spawn_metrics_listener(state: &Arc<ProxyState>) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "metrics listener accept failed");
+                    // Back off so fd exhaustion cannot spin this loop.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             };

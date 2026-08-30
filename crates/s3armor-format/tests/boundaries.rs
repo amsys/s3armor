@@ -82,6 +82,31 @@ fn ciphertext_and_plaintext_len_invert_at_every_boundary() {
 }
 
 #[test]
+fn plaintext_len_rejects_a_truncated_ciphertext() {
+    // A ciphertext cut to exactly `k*full + overhead` (k >= 1) is a length
+    // no encoder produces: the final frame would carry zero plaintext bytes,
+    // yet earlier full frames exist. Accepting it would report `k*CHUNK`
+    // plaintext and stream a short body under a satisfied Content-Length.
+    for alg in algs() {
+        let overhead = alg.overhead() as u64;
+        let full = CHUNK + overhead;
+        for k in 1..=3u64 {
+            let truncated = k * full + overhead;
+            assert!(
+                plaintext_len(alg, truncated, CHUNK).is_err(),
+                "alg={alg:?} k={k}: truncated ct_len {truncated} must be rejected"
+            );
+        }
+        // An empty object is a single zero-plaintext frame — still valid.
+        assert_eq!(
+            plaintext_len(alg, overhead, CHUNK).unwrap(),
+            0,
+            "alg={alg:?}"
+        );
+    }
+}
+
+#[test]
 fn one_shot_round_trip_at_every_boundary() {
     for alg in algs() {
         for pt_len in boundary_lengths() {

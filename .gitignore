@@ -20,3 +20,6 @@ crates/s3armor/fuzz/target/
 
 # Coverage report generated for the SonarCloud scan; not committed.
 /lcov.info
+
+# Agent memory sync artifacts (auto-generated).
+/memory/

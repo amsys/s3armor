@@ -62,14 +62,22 @@ pub fn hashing(mut inner: Incoming, expected_sha256_hex: String) -> ProxyBody {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
     tokio::spawn(async move {
         let mut hasher = Sha256::new();
+        // Hold the most recent frame back. The outbound stream must not
+        // satisfy content-length until the digest is verified at EOF —
+        // otherwise hyper stops polling the body and a mismatch reported
+        // after the last byte is never seen, so a tampered passthrough PUT
+        // would commit. Same discipline as `finish_encrypting`.
+        let mut pending: Option<Frame<Bytes>> = None;
         loop {
             match inner.frame().await {
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
                         hasher.update(data);
                     }
-                    if tx.send(Ok(frame)).await.is_err() {
-                        return;
+                    if let Some(prev) = pending.replace(frame) {
+                        if tx.send(Ok(prev)).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -84,6 +92,10 @@ pub fn hashing(mut inner: Incoming, expected_sha256_hex: String) -> ProxyBody {
                                 "payload hash mismatch: expected {expected_sha256_hex}, got {digest}"
                             ))))
                             .await;
+                        return;
+                    }
+                    if let Some(last) = pending.take() {
+                        let _ = tx.send(Ok(last)).await;
                     }
                     return;
                 }
@@ -171,7 +183,18 @@ async fn forward_chunks(
     tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
 ) -> bool {
     for (data, signature) in chunks {
-        if let (Some(v), Some(sig)) = (verifier.as_mut(), signature.as_deref()) {
+        if let Some(v) = verifier.as_mut() {
+            // A signed stream (STREAMING-AWS4-HMAC-SHA256-PAYLOAD, which the
+            // signed `x-amz-content-sha256` locks in) must carry a signature
+            // on every chunk, the zero-length terminator included. A missing
+            // signature means an attacker stripped it; fail closed rather
+            // than forward the chunk unverified.
+            let Some(sig) = signature.as_deref() else {
+                let _ = tx
+                    .send(Err(io_err("aws-chunked chunk missing its signature")))
+                    .await;
+                return false;
+            };
             if let Err(e) = v.verify_and_advance(&data, sig) {
                 let _ = tx.send(Err(io_err(chunk_error_message(&e)))).await;
                 return false;
@@ -402,27 +425,25 @@ pub fn decrypting(
 /// `plan.last_chunk` is the object's actual last chunk — i.e. whether the
 /// final frame in this range was sealed with `last = true` on encrypt.
 ///
-/// # ponytail
-/// Buffers the whole covered ciphertext span in memory before trimming —
-/// O(range), not O(chunk). A range is a client-requested window, not the
-/// whole object (video seeking, resumable downloads), so this is a
-/// deliberate ceiling, not the hot path (`decrypting` above stays
-/// O(chunk)). Upgrade path: stream every fully-covered middle chunk
-/// untouched and only special-case the first/last chunk's trim, if a
-/// benchmark shows large ranged reads need it.
-#[expect(
-    clippy::indexing_slicing,
-    reason = "start/end are both clamped to buf.len() by .min() just above"
-)]
-pub fn decrypting_range(
-    mut inner: Incoming,
+/// Streams the range O(chunk): the `Decryptor` yields every non-final
+/// covered chunk from `push` (all of them inside the requested window, so
+/// they stream straight out after the leading `trim_start` is dropped), and
+/// only the final chunk from `finish` needs `trim_end` applied. Each chunk
+/// is verified before it is released, and a send that fails because the
+/// client disconnected stops the task instead of draining the backend.
+pub fn decrypting_range<B>(
+    mut inner: B,
     alg: Alg,
     dek: [u8; 32],
     chunk_size: usize,
     plan: &RangePlan,
     total_chunks: u64,
     on_verify_failure: Option<Arc<AtomicU64>>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send,
+{
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
     let first_chunk = plan.first_chunk;
     let final_frame_is_object_end = plan.last_chunk + 1 == total_chunks;
@@ -436,7 +457,10 @@ pub fn decrypting_range(
             first_chunk,
             final_frame_is_object_end,
         );
-        let mut buf = Vec::new();
+        // Leading plaintext bytes still to skip. `trim_start` is an offset
+        // within the first chunk (`plan_range`'s doc comment), so it is
+        // consumed from the first bytes `push` yields.
+        let mut to_drop = trim_start;
         loop {
             match inner.frame().await {
                 Some(Ok(frame)) => {
@@ -444,7 +468,19 @@ pub fn decrypting_range(
                         continue;
                     };
                     match dec.push(&data) {
-                        Ok(pt) => buf.extend(pt),
+                        Ok(mut pt) => {
+                            if to_drop >= pt.len() {
+                                to_drop -= pt.len();
+                            } else {
+                                pt.drain(..to_drop);
+                                to_drop = 0;
+                                if !pt.is_empty()
+                                    && tx.send(Ok(Frame::data(Bytes::from(pt)))).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
                         Err(e) => {
                             note_chunk_verify_failure(on_verify_failure.as_ref());
                             let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
@@ -457,30 +493,26 @@ pub fn decrypting_range(
                     return;
                 }
                 None => {
-                    // `trim_end` is an offset *within the last decrypted
-                    // chunk* (`plan_range`'s doc comment), not a global
-                    // offset into `buf` — it only coincides with a global
-                    // offset when the range covers exactly one chunk.
-                    // `trim_start` has no such caveat: the first chunk
-                    // always starts at `buf[0]`.
-                    let last_chunk_len = match dec.finish() {
-                        Ok(pt) => {
-                            let len = pt.len();
-                            buf.extend(pt);
-                            len
+                    // The final chunk. `trim_end` is an offset within it;
+                    // truncate to that, then drop any leading trim still
+                    // pending (a range that covers a single chunk).
+                    match dec.finish() {
+                        Ok(mut pt) => {
+                            pt.truncate(trim_end);
+                            if to_drop < pt.len() {
+                                pt.drain(..to_drop);
+                            } else {
+                                pt.clear();
+                            }
+                            if !pt.is_empty() {
+                                let _ = tx.send(Ok(Frame::data(Bytes::from(pt)))).await;
+                            }
                         }
                         Err(e) => {
                             note_chunk_verify_failure(on_verify_failure.as_ref());
                             let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
-                            return;
                         }
-                    };
-                    let last_chunk_start = buf.len() - last_chunk_len;
-                    let end = (last_chunk_start + trim_end).min(buf.len());
-                    let start = trim_start.min(end);
-                    let _ = tx
-                        .send(Ok(Frame::data(Bytes::from(buf[start..end].to_vec()))))
-                        .await;
+                    }
                     return;
                 }
             }
@@ -662,16 +694,16 @@ async fn emit_decrypt_result(
 /// that span, in part order, no more.
 ///
 /// # ponytail
-/// Buffers the whole covered ciphertext span, same ceiling as
-/// `decrypting_range` and for the same reason: a range is a bounded,
-/// client-requested window, not the whole object.
+/// Buffers the covered ciphertext span (`buf`) before decrypting it, but
+/// emits each part's trimmed plaintext as it is produced rather than
+/// accumulating the whole output. A whole-object range never reaches here:
+/// the caller routes a range that covers the entire object to the full
+/// streaming path (`intercept::get`), so `plan` is always a bounded,
+/// client-requested window. A send that fails because the client
+/// disconnected stops the task.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "span/chunk sizes are config-bounded well under usize::MAX on every supported (64-bit) target"
-)]
-#[expect(
-    clippy::indexing_slicing,
-    reason = "start/end are both derived from and clamped to decrypted.len() just above"
 )]
 pub fn decrypting_multipart_range(
     mut inner: Incoming,
@@ -699,7 +731,6 @@ pub fn decrypting_multipart_range(
                 None => break,
             }
         }
-        let mut out = Vec::new();
         let mut offset = 0usize;
         let n = plan.len();
         for (i, (span, range_plan)) in plan.iter().enumerate() {
@@ -745,9 +776,19 @@ pub fn decrypting_multipart_range(
             } else {
                 decrypted.len()
             };
-            out.extend_from_slice(&decrypted[start..end]);
+            // Emit this part's trimmed slice now instead of accumulating the
+            // whole output. A gone receiver stops the task.
+            if let Some(piece) = decrypted.get(start..end) {
+                if !piece.is_empty()
+                    && tx
+                        .send(Ok(Frame::data(Bytes::copy_from_slice(piece))))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
         }
-        let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
     });
     StreamBody::new(ReceiverStream(rx)).boxed()
 }
@@ -787,7 +828,7 @@ impl<T> futures_util::Stream for ReceiverStream<T> {
 #[cfg(test)]
 mod tests {
     use futures_util::stream;
-    use s3armor_format::v1::{decrypt_all, encrypt_all, part_layout};
+    use s3armor_format::v1::{decrypt_all, encrypt_all, part_layout, plan_range};
 
     use super::*;
     use crate::chunked::ChunkVerifier;
@@ -884,6 +925,34 @@ mod tests {
     async fn dechunking_rejects_a_bad_chunk_signature() {
         let seed = "0".repeat(64);
         let wire = chunk_wire(b"payload", Some(&"f".repeat(64)));
+        let res = dechunking(full(Bytes::from(wire)), Some(verifier(&seed)))
+            .collect()
+            .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn dechunking_rejects_a_signed_stream_whose_chunk_lost_its_signature() {
+        // Verifier present (signed scheme), but the wire chunk carries no
+        // ;chunk-signature= extension: an attacker stripped it. Fail closed,
+        // never forward the chunk unverified.
+        let seed = "0".repeat(64);
+        let mut wire = chunk_wire(b"payload", None);
+        wire.extend(final_chunk(None));
+        let res = dechunking(full(Bytes::from(wire)), Some(verifier(&seed)))
+            .collect()
+            .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn dechunking_rejects_a_signed_stream_with_an_unsigned_terminator() {
+        // A valid signed data chunk, then a terminator stripped of its
+        // signature. The terminator is still checked, so this fails.
+        let seed = "0".repeat(64);
+        let sig1 = chain_signature(&seed, b"payload");
+        let mut wire = chunk_wire(b"payload", Some(&sig1));
+        wire.extend(final_chunk(None));
         let res = dechunking(full(Bytes::from(wire)), Some(verifier(&seed)))
             .collect()
             .await;
@@ -1020,6 +1089,45 @@ mod tests {
         let pt = decrypt_all(Alg::Aes256Gcm, &KEY, 0, CHUNK, &out[..ct_len]).expect("decrypts");
         assert_eq!(pt, plaintext);
         assert_eq!(&out[ct_len..], trailer.as_ref());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::integer_division,
+        reason = "test ranges are tiny constants; the mid split needs no precision"
+    )]
+    async fn decrypting_range_streams_the_exact_requested_window() {
+        // 3 chunks of CHUNK=16: two full, one 8-byte final.
+        let plaintext: Vec<u8> = (0u8..40).collect();
+        let ct = encrypt_all(Alg::Aes256Gcm, &KEY, 0, CHUNK, &plaintext);
+        let pt_len = plaintext.len() as u64;
+        let total_chunks = 3;
+        // Windows that exercise: trims on both edges across chunks, a
+        // single middle chunk, a window ending at the object end, and a
+        // whole single chunk with no trim.
+        for (start, end) in [(5u64, 35u64), (18, 25), (33, 40), (16, 32)] {
+            let plan = plan_range(Alg::Aes256Gcm, pt_len, CHUNK as u64, start, end).unwrap();
+            let covered = ct[plan.ct_start as usize..plan.ct_end as usize].to_vec();
+            // Split mid-frame so the decryptor state carries across reads.
+            let mid = covered.len() / 2;
+            let body = body_from_frames(vec![covered[..mid].to_vec(), covered[mid..].to_vec()]);
+            let out = collect_ok(decrypting_range(
+                body,
+                Alg::Aes256Gcm,
+                KEY,
+                CHUNK,
+                &plan,
+                total_chunks,
+                None,
+            ))
+            .await;
+            assert_eq!(
+                out,
+                &plaintext[start as usize..end as usize],
+                "range {start}..{end}"
+            );
+        }
     }
 
     type TwoPartObject = (Vec<(u32, &'static [u8])>, Vec<Vec<u8>>);

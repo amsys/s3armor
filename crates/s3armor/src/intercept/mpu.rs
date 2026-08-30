@@ -55,6 +55,11 @@ use crate::proxy::{
 /// S3's minimum size for every part but the last.
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
+/// Largest `CompleteMultipartUpload` request body this node buffers. The XML
+/// for 10000 parts is well under this; the cap stops an unknown or oversized
+/// Complete from buffering a client-chosen amount of memory.
+const MAX_COMPLETE_XML_BYTES: usize = 4 * 1024 * 1024;
+
 fn bucket_key(raw_path: &str) -> Result<(String, String), S3Error> {
     let route = route::parse(raw_path);
     match (route.bucket, route.key) {
@@ -93,6 +98,11 @@ pub async fn handle_create(
     mut outbound_headers: Vec<(String, String)>,
     request_id: &str,
 ) -> Result<Response<ProxyBody>, S3Error> {
+    // Reject before initiating a backend upload, so a node already at the
+    // session cap does not leave an orphaned multipart upload behind.
+    if state.sessions.len() >= crate::mpu::MAX_SESSIONS {
+        return Err(S3Error::slow_down());
+    }
     let alg = state.config.alg;
     let chunk_size = state.config.chunk_size;
 
@@ -137,12 +147,16 @@ pub async fn handle_create(
         .ok_or_else(|| S3Error::bad_gateway("backend did not return an UploadId"))?;
 
     let (bucket, key) = bucket_key(raw_path)?;
-    state.sessions.create(
+    if !state.sessions.create(
         (backend.name.clone(), bucket, key, upload_id),
         dek,
         alg,
         chunk_size,
-    );
+    ) {
+        // Lost a race against the cap after the backend initiated the upload.
+        // The backend's own incomplete-upload lifecycle reclaims the orphan.
+        return Err(S3Error::slow_down());
+    }
     state.record_mpu_session_created();
 
     Ok(build_client_response(parts, body::full(xml), request_id))
@@ -167,6 +181,15 @@ pub async fn handle_upload_part(
     let part_number: u32 = query_value(raw_query, "partNumber")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| S3Error::bad_gateway("no or invalid partNumber"))?;
+    // S3 part numbers are 1..=10000, and the footer reserves u32::MAX. Reject
+    // anything else here: a crafted partNumber would otherwise seal a frame
+    // whose AAD collides with the footer, a footer-forgery oracle under the
+    // session DEK.
+    if !(1..=10_000).contains(&part_number) {
+        return Err(S3Error::invalid_part(
+            "partNumber must be between 1 and 10000",
+        ));
+    }
     let (bucket, key) = bucket_key(raw_path)?;
     let session_key: SessionKey = (backend.name.clone(), bucket, key, upload_id.clone());
 
@@ -316,7 +339,21 @@ pub async fn handle_complete(
     let (bucket, key) = bucket_key(raw_path)?;
     let session_key: SessionKey = (backend.name.clone(), bucket, key, upload_id.clone());
 
-    let body_bytes = base_body
+    // Look the session up before reading the body: an unknown uploadId must
+    // fail fast, not after buffering a client-chosen amount. A retried
+    // Complete returns its cached response without reading the body at all.
+    {
+        let entry = state
+            .sessions
+            .get(&session_key)
+            .ok_or_else(|| S3Error::no_such_upload(&upload_id))?;
+        if let Some(cached) = entry.completed.clone() {
+            drop(entry);
+            return Ok(cached_response(cached, request_id));
+        }
+    }
+
+    let body_bytes = Limited::new(base_body, MAX_COMPLETE_XML_BYTES)
         .collect()
         .await
         .map_err(|e| S3Error::bad_gateway(format!("reading Complete body: {e}")))?
@@ -394,88 +431,123 @@ pub async fn handle_complete(
             )));
         }
     }
-    let footer = Footer {
-        alg,
-        parts: parts_snapshot,
-        total_pt,
-        md5: None,
-    };
-    let sealed_footer = footer.seal(&dek);
+    // Claim the completion so a second concurrent Complete for this upload
+    // backs off instead of racing a duplicate footer upload (which would make
+    // the first Complete name an ETag the backend no longer holds). A retried
+    // sequential Complete still returns the cached response checked above.
+    {
+        let mut entry = state
+            .sessions
+            .get_mut(&session_key)
+            .ok_or_else(|| S3Error::no_such_upload(&upload_id))?;
+        if let Some(cached) = entry.completed.clone() {
+            drop(entry);
+            return Ok(cached_response(cached, request_id));
+        }
+        if entry.completing {
+            return Err(S3Error::slow_down());
+        }
+        entry.completing = true;
+    }
 
-    let mut final_parts = client_parts.clone();
-    if let Some(tail_ct) = tail {
-        let mut merged = tail_ct.to_vec();
-        merged.extend_from_slice(&sealed_footer);
-        let etag = upload_raw_part(
+    let outcome: Result<Response<ProxyBody>, S3Error> = async {
+        let footer = Footer {
+            alg,
+            parts: parts_snapshot,
+            total_pt,
+            md5: None,
+        };
+        let sealed_footer = footer.seal(&dek);
+
+        let mut final_parts = client_parts.clone();
+        if let Some(tail_ct) = tail {
+            let mut merged = tail_ct.to_vec();
+            merged.extend_from_slice(&sealed_footer);
+            let etag = upload_raw_part(
+                state,
+                backend,
+                raw_path,
+                &upload_id,
+                last_number,
+                Bytes::from(merged),
+            )
+            .await?;
+            for (n, e) in &mut final_parts {
+                if *n == last_number {
+                    e.clone_from(&etag);
+                }
+            }
+        } else {
+            let footer_number = last_number
+                .checked_add(1)
+                .ok_or_else(|| S3Error::bad_gateway("multipart part numbers exhausted"))?;
+            let etag = upload_raw_part(
+                state,
+                backend,
+                raw_path,
+                &upload_id,
+                footer_number,
+                Bytes::from(sealed_footer),
+            )
+            .await?;
+            final_parts.push((footer_number, etag));
+        }
+
+        let complete_xml = build_complete_xml(&final_parts);
+        let mut complete_headers = outbound_headers;
+        set_header(
+            &mut complete_headers,
+            "content-length",
+            &complete_xml.len().to_string(),
+        );
+        let backend_resp = forward(
             state,
             backend,
+            "POST",
             raw_path,
-            &upload_id,
-            last_number,
-            Bytes::from(merged),
+            raw_query,
+            complete_headers,
+            body::full(Bytes::from(complete_xml)),
         )
         .await?;
-        for (n, e) in &mut final_parts {
-            if *n == last_number {
-                e.clone_from(&etag);
+        let (parts, incoming) = backend_resp.into_parts();
+        let out_bytes = incoming
+            .collect()
+            .await
+            .map_err(|e| S3Error::bad_gateway(format!("reading Complete response: {e}")))?
+            .to_bytes();
+
+        if let Some(mut entry) = state.sessions.get_mut(&session_key) {
+            if parts.status.is_success() {
+                entry.completed = Some(CachedComplete {
+                    status: parts.status,
+                    headers: to_pairs(&parts.headers),
+                    body: out_bytes.clone(),
+                });
+                entry.touch();
+            } else {
+                // `forward` returns Ok for any backend HTTP status, so a
+                // non-2xx Complete (e.g. a transient 503) reaches here as a
+                // success `outcome` and would leave `completing` stuck true,
+                // wedging every retry until TTL. Release the claim so the
+                // client can retry.
+                entry.completing = false;
             }
         }
-    } else {
-        let footer_number = last_number
-            .checked_add(1)
-            .ok_or_else(|| S3Error::bad_gateway("multipart part numbers exhausted"))?;
-        let etag = upload_raw_part(
-            state,
-            backend,
-            raw_path,
-            &upload_id,
-            footer_number,
-            Bytes::from(sealed_footer),
-        )
-        .await?;
-        final_parts.push((footer_number, etag));
+        Ok(build_client_response(
+            parts,
+            body::full(out_bytes),
+            request_id,
+        ))
     }
-
-    let complete_xml = build_complete_xml(&final_parts);
-    let mut complete_headers = outbound_headers;
-    set_header(
-        &mut complete_headers,
-        "content-length",
-        &complete_xml.len().to_string(),
-    );
-    let backend_resp = forward(
-        state,
-        backend,
-        "POST",
-        raw_path,
-        raw_query,
-        complete_headers,
-        body::full(Bytes::from(complete_xml)),
-    )
-    .await?;
-    let (parts, incoming) = backend_resp.into_parts();
-    let out_bytes = incoming
-        .collect()
-        .await
-        .map_err(|e| S3Error::bad_gateway(format!("reading Complete response: {e}")))?
-        .to_bytes();
-
-    if parts.status.is_success() {
-        let cached = CachedComplete {
-            status: parts.status,
-            headers: to_pairs(&parts.headers),
-            body: out_bytes.clone(),
-        };
+    .await;
+    // On failure, release the claim so a later retry can complete.
+    if outcome.is_err() {
         if let Some(mut entry) = state.sessions.get_mut(&session_key) {
-            entry.completed = Some(cached);
-            entry.touch();
+            entry.completing = false;
         }
     }
-    Ok(build_client_response(
-        parts,
-        body::full(out_bytes),
-        request_id,
-    ))
+    outcome
 }
 
 async fn upload_raw_part(

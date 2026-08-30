@@ -126,6 +126,12 @@ fn parse_list_xml(xml: &str) -> Result<ListPage, ToolError> {
             _ => {}
         }
     }
+    if is_truncated && next_token.is_none() {
+        // Ending the walk here would report success over only the first page.
+        return Err(ToolError::Backend(
+            "backend reported truncation with no continuation token".to_string(),
+        ));
+    }
     Ok(ListPage {
         objects,
         next_token: if is_truncated { next_token } else { None },

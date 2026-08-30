@@ -133,15 +133,16 @@ fn footer_frame_corruption_fails() {
 #[test]
 #[expect(
     clippy::integer_division,
-    reason = "halving MAX to get a large-but-valid u64"
+    reason = "halving MAX to get a value far above any real footer"
 )]
 fn footer_trailer_length_field_corruption_fails() {
     let sealed = make_footer_bytes();
     let mut trailer = sealed[sealed.len() - 16..].to_vec();
-    // Claim a footer frame far larger than what actually precedes it.
+    // Claim a footer frame far larger than any real footer. parse_trailer
+    // bounds the length by MAX_FOOTER_LEN, so a reader never buffers a whole
+    // object from a crafted trailer.
     trailer[8..16].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
-    let claimed_len = Footer::parse_trailer(&trailer).unwrap();
-    assert!(claimed_len as usize > sealed.len());
+    assert!(Footer::parse_trailer(&trailer).is_err());
 }
 
 // --- v1 emd5 --------------------------------------------------------------

@@ -45,6 +45,19 @@ pub struct CachedComplete {
 /// than silently mis-merging.
 pub const MAX_TAIL_BYTES: usize = 3 * 5 * 1024 * 1024;
 
+/// Largest number of concurrent multipart sessions this node holds. Each is
+/// a few hundred bytes plus up to `MAX_TAIL_BYTES` of buffered tails, so an
+/// unbounded count is a memory DoS. `create` rejects past this with
+/// `SlowDown`. The check-then-insert is not atomic, so concurrent creates
+/// can overshoot the cap by at most the number of in-flight requests — a
+/// soft bound, which is enough for a DoS ceiling.
+///
+/// ponytail: a flat count cap, not a global tail-byte budget. It bounds the
+/// session count directly; per-session tail RAM is already bounded by
+/// `MAX_TAIL_BYTES`. Add a shared tail-byte budget only if concurrent
+/// sub-5-MiB uploads are shown to pressure the memory target.
+pub const MAX_SESSIONS: usize = 1024;
+
 pub struct Session {
     pub dek: [u8; 32],
     pub alg: Alg,
@@ -61,6 +74,11 @@ pub struct Session {
     pub tails: BTreeMap<u32, Bytes>,
     pub last_activity: Instant,
     pub completed: Option<CachedComplete>,
+    /// A `CompleteMultipartUpload` is uploading the footer and completing on
+    /// the backend right now. Set under the session guard so a second,
+    /// concurrent Complete for the same upload gets `SlowDown` instead of
+    /// racing a duplicate footer upload. Cleared if that attempt fails.
+    pub completing: bool,
 }
 
 impl Drop for Session {
@@ -79,6 +97,7 @@ impl Session {
             tails: BTreeMap::new(),
             last_activity: Instant::now(),
             completed: None,
+            completing: false,
         }
     }
 
@@ -120,8 +139,16 @@ impl Sessions {
         Self(DashMap::new())
     }
 
-    pub fn create(&self, key: SessionKey, dek: [u8; 32], alg: Alg, chunk_size: u32) {
+    /// Creates a session, unless the node is already at `MAX_SESSIONS` (and
+    /// this key is new). Returns `false` when the cap rejects it, so the
+    /// caller can answer `SlowDown` rather than growing memory without bound.
+    #[must_use]
+    pub fn create(&self, key: SessionKey, dek: [u8; 32], alg: Alg, chunk_size: u32) -> bool {
+        if self.0.len() >= MAX_SESSIONS && !self.0.contains_key(&key) {
+            return false;
+        }
         self.0.insert(key, Session::new(dek, alg, chunk_size));
+        true
     }
 
     pub fn get(
@@ -211,7 +238,7 @@ mod tests {
             "k".to_string(),
             "u1".to_string(),
         );
-        sessions.create(key.clone(), [0x11; 32], Alg::Aes256Gcm, 1024);
+        assert!(sessions.create(key.clone(), [0x11; 32], Alg::Aes256Gcm, 1024));
         assert_eq!(sessions.len(), 1);
         assert!(sessions.get(&key).is_some());
         sessions.remove(&key);
@@ -254,9 +281,9 @@ mod tests {
             "u3".to_string(),
         );
 
-        sessions.create(fresh.clone(), [0x01; 32], Alg::Aes256Gcm, 1024);
-        sessions.create(stale_incomplete.clone(), [0x02; 32], Alg::Aes256Gcm, 1024);
-        sessions.create(stale_completed.clone(), [0x03; 32], Alg::Aes256Gcm, 1024);
+        assert!(sessions.create(fresh.clone(), [0x01; 32], Alg::Aes256Gcm, 1024));
+        assert!(sessions.create(stale_incomplete.clone(), [0x02; 32], Alg::Aes256Gcm, 1024));
+        assert!(sessions.create(stale_completed.clone(), [0x03; 32], Alg::Aes256Gcm, 1024));
 
         let old = Instant::now().checked_sub(Duration::from_hours(2)).unwrap();
         sessions.get_mut(&stale_incomplete).unwrap().last_activity = old;

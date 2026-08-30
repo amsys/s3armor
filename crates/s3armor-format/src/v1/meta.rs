@@ -133,7 +133,11 @@ impl ObjectMeta {
         let kek = Kek::parse(get(m, KEY_KEK)?)?;
         let kid = get(m, KEY_KID)?.to_string();
         let dek_str = get(m, KEY_DEK)?;
-        let wrapped_dek = B64.decode(dek_str).map_err(|_| invalid(KEY_DEK, dek_str))?;
+        // Do not echo the value: the wrapped DEK reaches the client XML
+        // error body through Error's Display. A fixed description is enough.
+        let wrapped_dek = B64
+            .decode(dek_str)
+            .map_err(|_| invalid(KEY_DEK, "not valid base64"))?;
         let chunk_str = get(m, KEY_CHUNK)?;
         let chunk_size: u32 = chunk_str
             .parse()
@@ -142,7 +146,10 @@ impl ObjectMeta {
             .ok_or_else(|| invalid(KEY_CHUNK, chunk_str))?;
         let multipart = m.get(KEY_MP).is_some_and(|s| s == "1");
         let emd5 = match m.get(KEY_EMD5) {
-            Some(s) => Some(B64.decode(s).map_err(|_| invalid(KEY_EMD5, s))?),
+            Some(s) => Some(
+                B64.decode(s)
+                    .map_err(|_| invalid(KEY_EMD5, "not valid base64"))?,
+            ),
             None => None,
         };
         Ok(Self {

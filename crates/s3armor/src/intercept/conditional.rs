@@ -71,10 +71,21 @@ impl Conditionals {
 }
 
 fn take_header(headers: &mut Vec<(String, String)>, name: &str) -> Option<String> {
-    let idx = headers
-        .iter()
-        .position(|(k, v)| k.eq_ignore_ascii_case(name) && v.trim() != "*")?;
-    Some(headers.remove(idx).1)
+    // Drain every non-`*` matching entry (a request may repeat a conditional
+    // header) and join them, RFC 9110-style, into one list. Taking only the
+    // first would leave the rest to reach the backend, which compares them
+    // against the ciphertext ETag the client never saw and returns a spurious
+    // 412. A bare `*` is existence-based and stays for the backend to answer.
+    let mut values = Vec::new();
+    headers.retain(|(k, v)| {
+        if k.eq_ignore_ascii_case(name) && v.trim() != "*" {
+            values.push(v.clone());
+            false
+        } else {
+            true
+        }
+    });
+    (!values.is_empty()).then(|| values.join(","))
 }
 
 /// Strips an optional weak (`W/`) prefix and surrounding quotes, so

@@ -341,7 +341,9 @@ async fn ranged_get_probe(
     let path = format!("/{bucket}/{}", encode_key_for_path(&key));
     let mut headers = Vec::new();
     set_header(&mut headers, "content-length", "20");
-    let _ = forward(
+    // Check the setup PUT: a failed setup would otherwise misdiagnose as
+    // "ranged GET returned 404", pointing the operator at the wrong feature.
+    match forward(
         state,
         backend,
         "PUT",
@@ -350,7 +352,22 @@ async fn ranged_get_probe(
         headers,
         body::full(Bytes::from(vec![0x11u8; 20])),
     )
-    .await;
+    .await
+    {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => {
+            return Probe {
+                name,
+                status: Status::Fail(format!("setup PUT returned {}", r.status())),
+            }
+        }
+        Err(e) => {
+            return Probe {
+                name,
+                status: Status::Fail(format!("setup PUT failed: {e}")),
+            }
+        }
+    }
 
     let mut get_headers = Vec::new();
     set_header(&mut get_headers, "range", "bytes=5-9");
@@ -381,7 +398,8 @@ async fn copy_preserves_metadata_probe(
     let mut put_headers = Vec::new();
     set_header(&mut put_headers, "content-length", "4");
     set_header(&mut put_headers, "x-amz-meta-s3a-v", "1");
-    let _ = forward(
+    // A failed setup PUT would misdiagnose as "CopyObject returned 404".
+    match forward(
         state,
         backend,
         "PUT",
@@ -390,7 +408,22 @@ async fn copy_preserves_metadata_probe(
         put_headers,
         body::full(Bytes::from_static(b"copy")),
     )
-    .await;
+    .await
+    {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => {
+            return Probe {
+                name,
+                status: Status::Fail(format!("setup PUT returned {}", r.status())),
+            }
+        }
+        Err(e) => {
+            return Probe {
+                name,
+                status: Status::Fail(format!("setup PUT failed: {e}")),
+            }
+        }
+    }
 
     let mut copy_headers = Vec::new();
     set_header(
@@ -503,10 +536,6 @@ async fn checksum_header_probe(
 /// The footer's tail-merge requirement (docs/ARCHITECTURE.md "Multipart v1"): every part
 /// but the last must be >= 5 MiB, except S3 must still accept the actual
 /// last part being small. Two parts, first >= 5 MiB, second 1 KiB.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one flat probe sequence: create, upload two parts, complete, verify; splitting would fragment a single auditable path"
-)]
 async fn multipart_small_final_part_probe(
     state: &ProxyState,
     backend: &Backend,
@@ -601,6 +630,7 @@ async fn multipart_small_final_part_probe(
                 };
             }
             Err(e) => {
+                abort_upload(state, backend, &path, &encoded_id).await;
                 return Probe {
                     name,
                     status: Status::Fail(format!("UploadPart {number} failed: {e}")),
@@ -609,7 +639,23 @@ async fn multipart_small_final_part_probe(
         }
     }
 
-    let complete_xml = build_complete_xml(&etags);
+    let status = complete_small_final_part(state, backend, &path, &encoded_id, &etags).await;
+    delete(state, backend, bucket, &key).await;
+    Probe { name, status }
+}
+
+/// Sends `CompleteMultipartUpload` for the probe and turns the outcome into a
+/// `Status`, aborting the upload on any failure so no parts are orphaned. S3
+/// can return 200 with an `<Error>` body for a late Complete failure, so the
+/// success body is inspected too.
+async fn complete_small_final_part(
+    state: &ProxyState,
+    backend: &Backend,
+    path: &str,
+    encoded_id: &str,
+    etags: &[(u32, String)],
+) -> Status {
+    let complete_xml = build_complete_xml(etags);
     let mut complete_headers = Vec::new();
     set_header(
         &mut complete_headers,
@@ -617,27 +663,62 @@ async fn multipart_small_final_part_probe(
         &complete_xml.len().to_string(),
     );
     let complete_query = format!("uploadId={encoded_id}");
-    let status = match forward(
+    let resp = forward(
         state,
         backend,
         "POST",
-        &path,
+        path,
         &complete_query,
         complete_headers,
         body::full(Bytes::from(complete_xml)),
     )
-    .await
-    {
-        Ok(r) if r.status().is_success() => Status::Ok,
-        Ok(r) => Status::Fail(format!(
-            "CompleteMultipartUpload with a small final part returned {} — this backend \
-             rejects the footer tail-merge this format relies on (docs/ARCHITECTURE.md 'Multipart v1')",
-            r.status()
-        )),
-        Err(e) => Status::Fail(format!("CompleteMultipartUpload failed: {e}")),
+    .await;
+    let ok = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            abort_upload(state, backend, path, encoded_id).await;
+            return Status::Fail(format!(
+                "CompleteMultipartUpload with a small final part returned {} — this backend \
+                 rejects the footer tail-merge this format relies on (docs/ARCHITECTURE.md 'Multipart v1')",
+                r.status()
+            ));
+        }
+        Err(e) => {
+            abort_upload(state, backend, path, encoded_id).await;
+            return Status::Fail(format!("CompleteMultipartUpload failed: {e}"));
+        }
     };
-    delete(state, backend, bucket, &key).await;
-    Probe { name, status }
+    match ok.into_body().collect().await {
+        Ok(b) => {
+            if b.to_bytes().windows(6).any(|w| w == b"<Error") {
+                abort_upload(state, backend, path, encoded_id).await;
+                Status::Fail(
+                    "CompleteMultipartUpload returned 200 with an <Error> body — this backend \
+                     rejects the small-final-part footer tail-merge this format relies on \
+                     (docs/ARCHITECTURE.md 'Multipart v1')"
+                        .to_string(),
+                )
+            } else {
+                Status::Ok
+            }
+        }
+        Err(e) => Status::Fail(format!("reading CompleteMultipartUpload body: {e}")),
+    }
+}
+
+/// Aborts an in-progress multipart upload so a failed probe leaves no
+/// orphaned parts behind. `encoded_id` is the already-path-encoded uploadId.
+async fn abort_upload(state: &ProxyState, backend: &Backend, path: &str, encoded_id: &str) {
+    let _ = forward(
+        state,
+        backend,
+        "DELETE",
+        path,
+        &format!("uploadId={encoded_id}"),
+        Vec::new(),
+        body::empty(),
+    )
+    .await;
 }
 
 async fn delete(state: &ProxyState, backend: &Backend, bucket: &str, key: &str) {

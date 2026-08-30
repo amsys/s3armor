@@ -15,14 +15,19 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
-/// Above this many tracked IPs, a `record_failure` call also prunes buckets
-/// that are both full (nothing to lose by dropping them) and untouched for
-/// a while. No background sweeper task — the prune rides along with normal
-/// traffic instead of needing its own scheduling.
-/// ponytail: O(n) prune scan on the triggering call only; a real LRU would
-/// amortize this, upgrade if the tracked-IP count ever gets large enough
-/// to matter under a benchmark.
-const PRUNE_ABOVE: usize = 100_000;
+/// Ceiling on tracked IPs. The check-then-insert is not atomic across
+/// DashMap shards, so concurrent failures from new IPs can overshoot the cap
+/// by at most the number of in-flight requests; the next arrival evicts back
+/// down. That keeps memory and the per-call eviction scan bounded — the failure
+/// the old "prune only full-and-idle buckets" logic had under a spray from
+/// an IPv6 /64, where every bucket stays fresh and non-full and the prune
+/// frees nothing while the map keeps growing.
+///
+/// ponytail: eviction is an O(MAX_TRACKED_IPS) scan on the triggering call
+/// only (a new IP arriving at the cap). That is bounded, not unbounded; a
+/// real LRU would make it O(1). Upgrade only if a benchmark shows the scan
+/// matters under sustained abuse.
+const MAX_TRACKED_IPS: usize = 100_000;
 const IDLE_PRUNE_AFTER_SECS: u64 = 3600;
 
 struct Bucket {
@@ -76,6 +81,16 @@ impl AuthRateLimiter {
             return;
         }
         let now = Instant::now();
+        // Bound the map before adding a new source. Try the cheap idle prune
+        // first; if it frees nothing (an attacker keeps every bucket fresh
+        // and non-full), evict the least-recently-used entry so the size
+        // stays at or below the hard cap.
+        if !self.buckets.contains_key(&ip) && self.buckets.len() >= MAX_TRACKED_IPS {
+            self.prune(now);
+            if self.buckets.len() >= MAX_TRACKED_IPS {
+                self.evict_oldest();
+            }
+        }
         {
             let mut entry = self.buckets.entry(ip).or_insert_with(|| Bucket {
                 tokens: self.capacity,
@@ -85,8 +100,18 @@ impl AuthRateLimiter {
             entry.tokens = (refilled - 1.0).max(0.0);
             entry.last = now;
         }
-        if self.buckets.len() > PRUNE_ABOVE {
-            self.prune(now);
+    }
+
+    /// Removes the entry with the oldest `last` timestamp. Called only when a
+    /// new IP arrives with the map already at the hard cap.
+    fn evict_oldest(&self) {
+        let oldest_key = self
+            .buckets
+            .iter()
+            .min_by_key(|e| e.value().last)
+            .map(|e| *e.key());
+        if let Some(key) = oldest_key {
+            self.buckets.remove(&key);
         }
     }
 
@@ -163,6 +188,18 @@ mod tests {
         assert!(!rl.allow(addr));
         sleep(Duration::from_millis(1100));
         assert!(rl.allow(addr));
+    }
+
+    #[test]
+    fn tracked_ip_count_stays_bounded_under_many_sources() {
+        let rl = AuthRateLimiter::new(1);
+        // More distinct source IPs than the hard cap: the map must not grow
+        // past it (the IPv6-/64-spray failure mode).
+        let count = u32::try_from(MAX_TRACKED_IPS + 20).unwrap();
+        for n in 0..count {
+            rl.record_failure(IpAddr::V4(Ipv4Addr::from(n)));
+        }
+        assert!(rl.buckets.len() <= MAX_TRACKED_IPS);
     }
 
     #[test]
