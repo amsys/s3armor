@@ -55,6 +55,7 @@ pprof = { version = "0.15", default-features = false, features = ["flamegraph"],
 toml = "0.8"
 
 [dev-dependencies]
+s3armor-format = { path = "../s3armor-format", features = ["test-util"] }
 aws-sigv4 = "1.5"
 aws-sdk-s3 = "1"
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }

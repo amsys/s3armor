@@ -7,6 +7,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test-only key generation helpers (RsaKek::generate).
+test-util = []
+
 # Pure crypto/framing crate: no tokio, no http. See AGENTS.md.
 [dependencies]
 aead = "0.5"

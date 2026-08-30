@@ -153,11 +153,12 @@ impl RsaKek {
         }
     }
 
-    /// Generates a fresh keypair — `openssl genpkey -algorithm RSA
-    /// -pkeyopt rsa_keygen_bits:4096` is the operator-facing equivalent.
-    /// 4096 bits, per docs/ARCHITECTURE.md "Keys and wrap" (a 512-byte
-    /// wrapped DEK, ~684 base64 chars, comfortably inside the 2 KB
-    /// user-metadata limit).
+    /// Generates a fresh keypair. Test-only: production keys come from
+    /// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096` (the
+    /// operator-facing equivalent), per docs/ARCHITECTURE.md "Keys and
+    /// wrap" (a 512-byte wrapped DEK, ~684 base64 chars, comfortably inside
+    /// the 2 KB user-metadata limit).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn generate(bits: usize) -> Result<Self> {
         let private = RsaPrivateKey::new(&mut OsRng, bits).map_err(|_| Error::UnwrapFailed)?;
         Ok(Self::from_private(private))
