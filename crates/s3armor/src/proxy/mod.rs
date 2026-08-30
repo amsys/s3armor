@@ -238,7 +238,9 @@ pub async fn handle(
             _ => {}
         }
     }
-    match handle_inner(&state, req, &request_id, peer_ip).await {
+    // The scope gives this request the abort slot its verifying body
+    // wrappers report into (`body::AbortSlot`).
+    match body::with_abort_slot(handle_inner(&state, req, &request_id, peer_ip)).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             tracing::warn!(request_id, code = e.code, message = %e.message, "request failed");
@@ -726,12 +728,16 @@ pub(crate) async fn forward(
     .await
     {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => {
+        // A verifying body wrapper that stopped this request records its own
+        // reason (`body::AbortSlot`): the client's bytes failed
+        // verification, not the backend, so answer with that code — an SDK
+        // must not retry a request that can never succeed.
+        Ok(Err(e)) => Err(body::abort_reason().unwrap_or_else(|| {
             // The transport error is a per-request internal detail; log it,
             // return a fixed message.
             tracing::error!(backend = %backend.name, error = %e, "backend request failed");
-            Err(S3Error::bad_gateway("upstream request failed".to_string()))
-        }
+            S3Error::bad_gateway("upstream request failed".to_string())
+        })),
         Err(_) => Err(S3Error::gateway_timeout(format!(
             "backend did not respond within {:?} (S3A_TIMEOUT_REQUEST)",
             state.config.timeout_request

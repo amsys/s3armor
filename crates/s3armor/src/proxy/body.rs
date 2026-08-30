@@ -5,13 +5,17 @@
 //! outbound body stream with an `Err` frame instead of a clean EOF. Hyper's
 //! client sees that as a failed send and aborts the connection to the
 //! backend rather than completing it, so a tampered PUT never commits.
+//! Every such client-caused abort also records its typed reason in the
+//! request's [`AbortSlot`], so `proxy::forward` answers with the S3 code
+//! for that failure instead of a generic `502`.
 //!
 //! Both are implemented as a spawned task feeding a channel, not a
 //! hand-written `poll_frame` state machine — simpler to get right, and the
 //! backpressure from a bounded channel already gives O(chunk) memory.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use http_body::Frame;
@@ -29,11 +33,78 @@ use tokio::sync::mpsc;
 use s3armor_format::v1::{n_chunks, Alg, Decryptor, Encryptor, PartSpan, RangePlan};
 
 use crate::chunked::{ChunkVerifier, ChunkedError, Dechunker};
+use crate::proxy::error::S3Error;
 
 pub type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
+/// Where a verifying wrapper records *why* it ended the outbound stream.
+/// The wrapper runs in a spawned task with no path back to the request, so
+/// the typed reason travels here instead. `proxy::forward` reads the slot
+/// when the backend request fails: a stored reason is the client's fault
+/// and answers with its own S3 code, an empty slot is a real upstream
+/// failure and stays a `502`.
+type AbortSlot = Arc<OnceLock<S3Error>>;
+
+tokio::task_local! {
+    static ABORT_REASON: AbortSlot;
+}
+
+/// Runs one request with its own abort slot. Called once, from
+/// `proxy::handle`.
+pub(crate) async fn with_abort_slot<T>(fut: impl Future<Output = T>) -> T {
+    ABORT_REASON.scope(AbortSlot::default(), fut).await
+}
+
+/// Why a verifying body aborted this request, when one did. `None` outside
+/// a request — the CLI tools call `forward` with no slot in scope.
+pub(crate) fn abort_reason() -> Option<S3Error> {
+    ABORT_REASON
+        .try_with(|slot| slot.get().cloned())
+        .ok()
+        .flatten()
+}
+
 fn io_err(msg: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(msg.to_string())
+}
+
+/// The outbound half of a verifying body: the frame channel, plus this
+/// request's [`AbortSlot`].
+struct Outbound {
+    tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    abort: AbortSlot,
+}
+
+impl Outbound {
+    /// Builds the channel and captures the current request's slot. Call
+    /// before the wrapper task is spawned — the slot is a task-local, and a
+    /// spawned task does not inherit one.
+    fn new() -> (Self, mpsc::Receiver<Result<Frame<Bytes>, std::io::Error>>) {
+        let (tx, rx) = mpsc::channel(4);
+        let abort = ABORT_REASON.try_with(Clone::clone).unwrap_or_default();
+        (Self { tx, abort }, rx)
+    }
+
+    /// Forwards one frame. `false` when the receiver is gone and the task
+    /// must stop.
+    async fn send(&self, frame: Frame<Bytes>) -> bool {
+        self.tx.send(Ok(frame)).await.is_ok()
+    }
+
+    /// Ends the stream because the client sent something that failed
+    /// verification. Records the reason first: `proxy::forward` reads the
+    /// slot as soon as it sees the request fail.
+    async fn fail(&self, reason: S3Error) {
+        let message = reason.message.clone();
+        let _ = self.abort.set(reason);
+        let _ = self.tx.send(Err(io_err(message))).await;
+    }
+
+    /// Ends the stream on a transport error reading the client's body. No
+    /// typed reason, so the request stays a `502`.
+    async fn fail_transport(&self, e: impl std::fmt::Display) {
+        let _ = self.tx.send(Err(io_err(e))).await;
+    }
 }
 
 pub fn empty() -> ProxyBody {
@@ -59,7 +130,7 @@ pub fn passthrough(incoming: Incoming) -> ProxyBody {
 /// module doc comment for why that's enough to stop the write reaching the
 /// backend.
 pub fn hashing(mut inner: Incoming, expected_sha256_hex: String) -> ProxyBody {
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
+    let (out, rx) = Outbound::new();
     tokio::spawn(async move {
         let mut hasher = Sha256::new();
         // Hold the most recent frame back. The outbound stream must not
@@ -75,27 +146,27 @@ pub fn hashing(mut inner: Incoming, expected_sha256_hex: String) -> ProxyBody {
                         hasher.update(data);
                     }
                     if let Some(prev) = pending.replace(frame) {
-                        if tx.send(Ok(prev)).await.is_err() {
+                        if !out.send(prev).await {
                             return;
                         }
                     }
                 }
                 Some(Err(e)) => {
-                    let _ = tx.send(Err(io_err(e))).await;
+                    out.fail_transport(e).await;
                     return;
                 }
                 None => {
                     let digest = hex::encode(hasher.finalize());
                     if digest != expected_sha256_hex {
-                        let _ = tx
-                            .send(Err(io_err(format!(
-                                "payload hash mismatch: expected {expected_sha256_hex}, got {digest}"
-                            ))))
-                            .await;
+                        out.fail(S3Error::payload_hash_mismatch(
+                            &expected_sha256_hex,
+                            &digest,
+                        ))
+                        .await;
                         return;
                     }
                     if let Some(last) = pending.take() {
-                        let _ = tx.send(Ok(last)).await;
+                        out.send(last).await;
                     }
                     return;
                 }
@@ -114,21 +185,22 @@ where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: std::fmt::Display + Send,
 {
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
+    let (out, rx) = Outbound::new();
     tokio::spawn(async move {
         let mut dechunker = Dechunker::new();
         loop {
-            let Some(raw) = next_raw_frame(&mut inner, &tx, &dechunker).await else {
+            let Some(raw) = next_raw_frame(&mut inner, &out, &dechunker).await else {
                 return;
             };
             let chunks = match dechunker.feed(&raw) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(Err(io_err(chunk_error_message(&e)))).await;
+                    out.fail(S3Error::incomplete_body(chunk_error_message(&e)))
+                        .await;
                     return;
                 }
             };
-            if !forward_chunks(chunks, &mut verifier, &tx).await {
+            if !forward_chunks(chunks, &mut verifier, &out).await {
                 return;
             }
         }
@@ -141,11 +213,7 @@ where
 /// on EOF before `dechunker` has seen the aws-chunked terminator; `None` on
 /// a clean, already-terminated EOF stops the caller with nothing more to
 /// send.
-async fn next_raw_frame<B>(
-    inner: &mut B,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
-    dechunker: &Dechunker,
-) -> Option<Bytes>
+async fn next_raw_frame<B>(inner: &mut B, out: &Outbound, dechunker: &Dechunker) -> Option<Bytes>
 where
     B: http_body::Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
@@ -159,14 +227,15 @@ where
                 // else: a trailers frame on the raw wire body; ignore, loop for the next one
             }
             Some(Err(e)) => {
-                let _ = tx.send(Err(io_err(e))).await;
+                out.fail_transport(e).await;
                 return None;
             }
             None => {
                 if !dechunker.is_done() {
-                    let _ = tx
-                        .send(Err(io_err("aws-chunked body ended before its terminator")))
-                        .await;
+                    out.fail(S3Error::incomplete_body(
+                        "aws-chunked body ended before its terminator",
+                    ))
+                    .await;
                 }
                 return None;
             }
@@ -180,7 +249,7 @@ where
 async fn forward_chunks(
     chunks: Vec<crate::chunked::DecodedChunk>,
     verifier: &mut Option<ChunkVerifier>,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    out: &Outbound,
 ) -> bool {
     for (data, signature) in chunks {
         if let Some(v) = verifier.as_mut() {
@@ -190,20 +259,18 @@ async fn forward_chunks(
             // signature means an attacker stripped it; fail closed rather
             // than forward the chunk unverified.
             let Some(sig) = signature.as_deref() else {
-                let _ = tx
-                    .send(Err(io_err("aws-chunked chunk missing its signature")))
-                    .await;
+                out.fail(S3Error::signature_does_not_match()).await;
                 return false;
             };
-            if let Err(e) = v.verify_and_advance(&data, sig) {
-                let _ = tx.send(Err(io_err(chunk_error_message(&e)))).await;
+            if v.verify_and_advance(&data, sig).is_err() {
+                out.fail(S3Error::signature_does_not_match()).await;
                 return false;
             }
         }
         if data.is_empty() {
             continue; // the terminating zero-length chunk carries no bytes to forward
         }
-        if tx.send(Ok(Frame::data(Bytes::from(data)))).await.is_err() {
+        if !out.send(Frame::data(Bytes::from(data))).await {
             return false;
         }
     }
@@ -254,7 +321,7 @@ pub fn encrypting(
     part_number: u32,
     trailer: Option<Bytes>,
 ) -> ProxyBody {
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
+    let (out, rx) = Outbound::new();
     tokio::spawn(async move {
         let mut enc = Encryptor::new(alg, dek, part_number, chunk_size);
         let mut hasher = expected_md5.is_some().then(Md5::new);
@@ -267,23 +334,22 @@ pub fn encrypting(
                     };
                     seen += data.len() as u64;
                     if seen > expected_pt_len {
-                        let _ = tx
-                            .send(Err(io_err(
-                                "streamed plaintext exceeds the declared decoded length",
-                            )))
-                            .await;
+                        out.fail(S3Error::incomplete_body(
+                            "streamed plaintext exceeds the declared decoded length",
+                        ))
+                        .await;
                         return;
                     }
                     if let Some(h) = hasher.as_mut() {
                         h.update(&data);
                     }
                     let ct = enc.push(&data);
-                    if !ct.is_empty() && tx.send(Ok(Frame::data(Bytes::from(ct)))).await.is_err() {
+                    if !ct.is_empty() && !out.send(Frame::data(Bytes::from(ct))).await {
                         return;
                     }
                 }
                 Some(Err(e)) => {
-                    let _ = tx.send(Err(io_err(e))).await;
+                    out.fail_transport(e).await;
                     return;
                 }
                 None => {
@@ -294,7 +360,7 @@ pub fn encrypting(
                         seen,
                         expected_pt_len,
                         trailer,
-                        &tx,
+                        &out,
                     )
                     .await;
                     return;
@@ -316,30 +382,29 @@ async fn finish_encrypting(
     seen: u64,
     expected_pt_len: u64,
     trailer: Option<Bytes>,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    out: &Outbound,
 ) {
     if seen != expected_pt_len {
-        let _ = tx
-            .send(Err(io_err(
-                "streamed plaintext is shorter than the declared decoded length",
-            )))
-            .await;
+        out.fail(S3Error::incomplete_body(
+            "streamed plaintext is shorter than the declared decoded length",
+        ))
+        .await;
         return;
     }
-    if let Err(msg) = check_md5(hasher, expected_md5) {
-        let _ = tx.send(Err(io_err(msg))).await;
+    if !check_md5(hasher, expected_md5) {
+        out.fail(S3Error::bad_digest()).await;
         return;
     }
-    let mut out = enc.finish();
+    let mut ct = enc.finish();
     if let Some(t) = &trailer {
-        out.extend_from_slice(t);
+        ct.extend_from_slice(t);
     }
-    let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
+    out.send(Frame::data(Bytes::from(ct))).await;
 }
 
 /// Checks a finished MD5 hasher against the client's `Content-MD5`, when
-/// both are present. `Ok(())` when there's nothing to check (no hasher
-/// means `expected_md5` was `None` to begin with).
+/// both are present. `true` when there's nothing to check (no hasher means
+/// `expected_md5` was `None` to begin with).
 ///
 /// MD5 is required here for S3 API compatibility, not for integrity: the
 /// client picks the hash (`Content-MD5`), and the same 16 bytes become the
@@ -348,16 +413,12 @@ async fn finish_encrypting(
 /// Actual integrity rests on AES-256-GCM/XChaCha20-Poly1305 AEAD per chunk
 /// plus SigV4 SHA-256 on the request; the ETag itself is stored AEAD-sealed
 /// (`s3a-emd5`), so it isn't a content-guessing oracle for the operator.
-fn check_md5(hasher: Option<Md5>, expected: Option<[u8; 16]>) -> Result<(), &'static str> {
+fn check_md5(hasher: Option<Md5>, expected: Option<[u8; 16]>) -> bool {
     let (Some(h), Some(expected)) = (hasher, expected) else {
-        return Ok(());
+        return true;
     };
     let got: [u8; 16] = h.finalize().into();
-    if got == expected {
-        Ok(())
-    } else {
-        Err("Content-MD5 does not match the streamed plaintext")
-    }
+    got == expected
 }
 
 /// Decrypts a full-object v1 ciphertext response stream, O(chunk) memory —
@@ -869,6 +930,19 @@ mod tests {
         StreamBody::new(s).boxed()
     }
 
+    /// Builds a verifying body inside a request-scoped abort slot, runs it
+    /// to its `Err` frame, and returns the reason the wrapper recorded —
+    /// the value `proxy::forward` answers the client with. `build` must run
+    /// inside the scope: the wrapper captures the slot when it is built.
+    async fn abort_of(build: impl FnOnce() -> ProxyBody) -> S3Error {
+        with_abort_slot(async move {
+            let res = build().collect().await;
+            assert!(res.is_err(), "expected an aborted stream");
+            abort_reason().expect("an aborted wrapper records why")
+        })
+        .await
+    }
+
     async fn collect_ok(body: ProxyBody) -> Vec<u8> {
         body.collect()
             .await
@@ -960,6 +1034,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dechunking_reports_a_bad_chunk_signature_as_signature_does_not_match() {
+        let seed = "0".repeat(64);
+        let wire = chunk_wire(b"payload", Some(&"f".repeat(64)));
+        let err = abort_of(|| dechunking(full(Bytes::from(wire)), Some(verifier(&seed)))).await;
+        assert_eq!(err.code, "SignatureDoesNotMatch");
+        assert_eq!(err.status, http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_broken_client_stream_records_no_abort_reason() {
+        // Nothing the proxy verifies failed — the client's own stream broke.
+        // The slot stays empty, so `proxy::forward` still answers 502.
+        let reason = with_abort_slot(async {
+            let frames = stream::iter(vec![Err::<Frame<Bytes>, std::io::Error>(io_err(
+                "client went away",
+            ))]);
+            let res = dechunking(StreamBody::new(frames).boxed(), None)
+                .collect()
+                .await;
+            assert!(res.is_err());
+            abort_reason()
+        })
+        .await;
+        assert!(reason.is_none(), "a transport failure is not the client's");
+    }
+
+    #[tokio::test]
     async fn dechunking_errors_on_eof_before_the_terminator() {
         // a well-formed header with data short of its declared length, and
         // no terminating zero-chunk behind it
@@ -1042,6 +1143,25 @@ mod tests {
             .collect()
             .await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypting_reports_a_content_md5_mismatch_as_bad_digest() {
+        let err = abort_of(|| {
+            encrypting(
+                full(Bytes::from_static(b"payload")),
+                Alg::Aes256Gcm,
+                KEY,
+                CHUNK,
+                Some([0u8; 16]),
+                7,
+                0,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(err.code, "BadDigest");
+        assert_eq!(err.status, http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

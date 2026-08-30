@@ -12,6 +12,10 @@ use super::body::{self, ProxyBody};
 /// An S3-shaped error: HTTP status, the `<Code>` S3 clients switch on, and
 /// a human message. Every response carries the request's actual
 /// correlation id in `<RequestId>` and in an `x-amz-request-id` header.
+///
+/// `Clone` because a verifying body wrapper keeps a copy in its abort slot
+/// (`proxy::body`) while the same reason travels to the client.
+#[derive(Clone)]
 pub struct S3Error {
     pub status: StatusCode,
     pub code: &'static str,
@@ -75,6 +79,37 @@ impl S3Error {
             "NotImplemented",
             format!("{op} is not supported by this proxy"),
         )
+    }
+
+    /// The streamed body does not match the client's own `Content-MD5`
+    /// (`proxy::body::check_md5`). A client fault, so `400` — a `502` would
+    /// tell the SDK to retry a PUT that can never succeed.
+    pub fn bad_digest() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "BadDigest",
+            "The Content-MD5 you specified did not match what we received.",
+        )
+    }
+
+    /// The streamed body does not hash to the signed `x-amz-content-sha256`
+    /// (`proxy::body::hashing`). Both values are the client's own, so the
+    /// message can name them.
+    pub fn payload_hash_mismatch(expected: &str, got: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            format!(
+                "The provided x-amz-content-sha256 header does not match what was computed: expected {expected}, got {got}"
+            ),
+        )
+    }
+
+    /// The body did not arrive as the client declared it: an aws-chunked
+    /// stream that decoded badly or ended before its terminator, or a byte
+    /// count that disagrees with `x-amz-decoded-content-length`.
+    pub fn incomplete_body(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "IncompleteBody", message)
     }
 
     pub fn bad_gateway(message: impl Into<String>) -> Self {

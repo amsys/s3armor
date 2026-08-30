@@ -219,7 +219,13 @@ pub async fn handle_upload_part(
         let plaintext = Limited::new(base_body, usize::try_from(pt_len).unwrap_or(usize::MAX))
             .collect()
             .await
-            .map_err(|e| S3Error::bad_gateway(format!("reading part body: {e}")))?
+            .map_err(|e| {
+                // The verifying wrapper under `base_body` reports a failed
+                // client body here too (`body::AbortSlot`), so a bad
+                // Content-MD5 or chunk signature keeps its own 4xx.
+                body::abort_reason()
+                    .unwrap_or_else(|| S3Error::bad_gateway(format!("reading part body: {e}")))
+            })?
             .to_bytes();
         if plaintext.len() as u64 != pt_len {
             return Err(S3Error::bad_gateway(

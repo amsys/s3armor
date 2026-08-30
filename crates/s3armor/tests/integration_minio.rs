@@ -986,15 +986,20 @@ async fn wrong_content_md5_aborts_the_put_and_leaves_no_object() {
         .await
         .expect("create bucket");
 
-    let result = client
+    let err = client
         .put_object()
         .bucket(bucket)
         .key(key)
         .content_md5(wrong_md5)
         .body(ByteStream::from_static(body))
         .send()
-        .await;
-    assert!(result.is_err(), "a wrong Content-MD5 must abort the PUT");
+        .await
+        .expect_err("a wrong Content-MD5 must abort the PUT");
+    // The client's own bytes failed verification, so this is a permanent
+    // `400 BadDigest`, never the `502` a gateway failure would get — an SDK
+    // retries a 502 and would replay a PUT that can never succeed.
+    assert_eq!(raw_status(&err), 400);
+    assert_eq!(error_code(&err).as_deref(), Some("BadDigest"));
 
     let listed = client
         .list_objects_v2()
@@ -1096,6 +1101,97 @@ async fn client_disconnect_mid_put_leaves_no_object() {
         listed.contents().len(),
         0,
         "a client that disconnects mid-PUT must leave no object behind"
+    );
+}
+
+/// A signed `x-amz-content-sha256` that does not match the bytes that
+/// follow it must fail as `400 XAmzContentSHA256Mismatch`, the same as real
+/// S3 — not the `502` this used to report, which tells an SDK to retry a
+/// PUT that can never succeed. The SDK never sends a payload hash it did
+/// not compute itself, so this is hand-signed over a raw request, like
+/// `client_disconnect_mid_put_leaves_no_object` above.
+#[tokio::test]
+async fn wrong_payload_hash_is_rejected_as_a_client_error() {
+    let (client, endpoint, _minio_endpoint, _minio) = setup().await;
+    let bucket = "bad-payload-hash";
+    let key = "mismatched.bin";
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create bucket");
+
+    let host = endpoint
+        .strip_prefix("http://")
+        .expect("proxy endpoint is http://host:port");
+    let amz_date = s3armor::sigv4::time::format_amz_date(std::time::SystemTime::now());
+    let path = format!("/{bucket}/{key}");
+    // The hash of a body that is not the one sent below.
+    let payload_hash = s3armor::sigv4::canonical::hex_sha256(b"the body the client promised");
+    let headers = vec![
+        ("host".to_string(), host.to_string()),
+        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        ("x-amz-date".to_string(), amz_date.clone()),
+    ];
+    let signed_names = vec![
+        "host".to_string(),
+        "x-amz-content-sha256".to_string(),
+        "x-amz-date".to_string(),
+    ];
+    let auth = s3armor::sigv4::sign::authorization_header(
+        "PUT",
+        &path,
+        "",
+        &headers,
+        &signed_names,
+        &payload_hash,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        "us-east-1",
+        "s3",
+        &amz_date,
+    );
+
+    let req = http::Request::builder()
+        .method("PUT")
+        .uri(format!("{endpoint}{path}"))
+        .header("x-amz-date", &amz_date)
+        .header("authorization", &auth)
+        .header("x-amz-content-sha256", &payload_hash)
+        .body(http_body_util::Full::new(bytes::Bytes::from_static(
+            b"the body the client actually sent",
+        )))
+        .expect("build PUT request");
+    let http_client: hyper_util::client::legacy::Client<_, http_body_util::Full<bytes::Bytes>> =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http();
+    let resp = http_client
+        .request(req)
+        .await
+        .expect("PUT reaches the proxy");
+    let status = resp.status();
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .expect("read the error body")
+        .to_bytes();
+    let xml = String::from_utf8_lossy(&body);
+    assert_eq!(status, 400, "a payload-hash mismatch is a 400: {xml}");
+    assert!(
+        xml.contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+        "expected XAmzContentSHA256Mismatch, got {xml}"
+    );
+
+    let listed = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("list objects");
+    assert_eq!(
+        listed.contents().len(),
+        0,
+        "no object must be left behind after a rejected PUT"
     );
 }
 
@@ -1834,6 +1930,17 @@ async fn cors_preflight_is_answered_before_auth() {
 /// The raw HTTP status of an `SdkError`'s underlying response, for
 /// asserting `304`/`412` — neither is a normal 2xx data response, so the
 /// SDK surfaces both as an `Err`, but the real status is still on the wire.
+/// The `<Code>` out of the S3 XML error body an `SdkError` carries — what
+/// a client switches on to tell "retry this" from "this request can never
+/// succeed".
+fn error_code<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> Option<String> {
+    let body = err.raw_response()?.body().bytes()?;
+    let xml = String::from_utf8_lossy(body);
+    let (_, after) = xml.split_once("<Code>")?;
+    let (code, _) = after.split_once("</Code>")?;
+    Some(code.to_string())
+}
+
 fn raw_status<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> u16 {
     err.raw_response().map_or_else(
         || panic!("expected an HTTP response on the error, got {err:?}"),
