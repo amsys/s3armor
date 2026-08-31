@@ -64,9 +64,9 @@ standard S3 deployment.
    256 MiB Proxmox LXC.
 4. Minimal configuration. A docker-compose file can be the complete system
    definition. A config file is optional, never required.
-5. Key handling is a first-class feature: generate, fingerprint, back up
-   ("wallet"), rotate. The proxy gives a loud, unmissable "store this key
-   safely" warning.
+5. Key handling is a first-class feature: generate, fingerprint, back up,
+   rotate. The proxy gives a loud, unmissable "store this key safely"
+   warning.
 6. Profiling-friendly build and runtime from day one.
 7. Benchmarks (`s3armor bench`) that recommend settings, and a user-launched
    backend conformance probe (`s3armor check`).
@@ -825,6 +825,16 @@ they would be pure overhead with no consumer.
 Every request carries a correlation id, both in logs and in the S3 error
 response's `RequestId` field. There is exactly one error-to-S3-XML mapper
 module in the whole proxy.
+
+A body-verification failure found mid-stream — a `Content-MD5` mismatch,
+a payload hash that does not match the signed `x-amz-content-sha256`, or
+an aws-chunked body that ends early — answers with the client's own S3
+error (`BadDigest`, `XAmzContentSHA256Mismatch`, `IncompleteBody`), not
+a generic `502`. The reason: a `502` tells an SDK to retry a request
+that can never succeed. The verifying body wrapper cannot return a
+response itself, so it records its typed error in a task-local slot
+(`proxy::body::with_abort_slot`); `proxy::forward` and the part-upload
+handler read that slot when the stream aborts and map it to the `4xx`.
 
 ---
 

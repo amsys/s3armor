@@ -366,7 +366,7 @@ single secret in it.
 
 ## 4. Key generation and rotation
 
-### 4.1 The wallet warning
+### 4.1 Back up the master key
 
 The master key is the only thing standing between your ciphertext and
 noise. There is no recovery path. If you lose the key, every object it

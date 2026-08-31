@@ -33,6 +33,12 @@ you fuzz, bench, and audit on its own.
 | `v1/multipart.rs` | Multipart size math (part sizing, part-count limits). |
 | `v1/wrap.rs` | Wraps and unwraps the per-object data-encryption key (DEK) under a master key or an RSA key. |
 
+The crate has one cargo feature, `test-util`. It exposes
+`RsaKek::generate` for tests. The feature is off by default: production
+keys come from `openssl`, never from the proxy. The `s3armor` crate
+enables it in `[dev-dependencies]` only, so the feature never reaches
+the release binary.
+
 ### `crates/s3armor/src`
 
 | Module | What it does |

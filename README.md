@@ -11,8 +11,6 @@
   <img src="https://img.shields.io/badge/status-beta-orange" alt="Status: beta">
 </p>
 
-*Client-side encryption proxy for S3, forged in Rust.*
-
 A small, fast client-side encryption proxy for S3-compatible storage
 (Hetzner Object Storage, MinIO, AWS, Ceph RGW). "Server-side encryption"
 leaves the key with the storage operator. This proxy makes the ciphertext
@@ -87,7 +85,7 @@ Prefer a config file over exporting variables? See
 [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) for the full `config.toml`
 reference, every `S3A_*` variable, TLS, metrics, and rate limiting.
 
-## The wallet warning
+## Back up the master key
 
 The master key is the data. If you lose it, encrypted objects are noise —
 the storage provider cannot help you. Store the key in a password manager
