@@ -247,11 +247,7 @@ async fn run_bench(args: BenchCli, config_path: Option<&str>) {
         tools::bench::write_config(&local);
         return;
     }
-    if args.json {
-        println!("{}", tools::bench::local_json(&local));
-    } else {
-        tools::bench::print_local(&local);
-    }
+    output_local_tier(&local, args.json);
 
     if !args.backend_tier && args.proxy.is_none() {
         return;
@@ -265,54 +261,76 @@ async fn run_bench(args: BenchCli, config_path: Option<&str>) {
     let backend = resolve_backend_or_exit(&state, args.backend.as_deref());
 
     if args.backend_tier {
-        let results = match tools::bench::run_backend(&state, backend, &bucket).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("s3armor: bench backend tier aborted: {e}");
-                std::process::exit(1);
-            }
-        };
-        if args.json {
-            println!("{}", tools::bench::backend_json(&results));
-        } else {
-            tools::bench::print_backend(&results);
-        }
-        let sweep = tools::bench::part_size_sweep(&state, backend, &bucket).await;
-        tools::bench::print_part_size_sweep(&sweep);
-        let concurrency = tools::bench::discover_concurrency(&state, backend, &bucket).await;
-        println!("max sustained concurrency (2x-latency knee): {concurrency}");
+        run_backend_tier(&state, backend, &bucket, args.json).await;
     }
 
     if let Some(proxy_url) = args.proxy {
-        // The proxy client speaks plain HTTP only (no TLS connector), so a
-        // non-http:// URL would silently time failed requests and report
-        // nonsense throughput. Reject it up front.
-        if !proxy_url.starts_with("http://") {
-            eprintln!("s3armor: bench --proxy must be an http:// URL (TLS to the proxy is not supported by this probe)");
+        run_proxy_tier(&state, backend, &bucket, &proxy_url, args.json).await;
+    }
+}
+
+fn output_local_tier(local: &[tools::bench::LocalResult], json: bool) {
+    if json {
+        println!("{}", tools::bench::local_json(local));
+    } else {
+        tools::bench::print_local(local);
+    }
+}
+
+async fn run_backend_tier(state: &Arc<ProxyState>, backend: &Backend, bucket: &str, json: bool) {
+    let results = match tools::bench::run_backend(state, backend, bucket).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("s3armor: bench backend tier aborted: {e}");
             std::process::exit(1);
         }
-        // The proxy under test authenticates like any other S3 client —
-        // reuse the first registered `S3A_CLIENT_<NAME>` credential this
-        // `bench` process was configured with (the same env a real
-        // operator runs `bench` alongside the proxy with).
-        let Some(cred) = state.config.clients.values().next() else {
-            eprintln!(
-                "s3armor: bench --proxy: no S3A_CLIENT_<NAME>_ACCESS_KEY/_SECRET_KEY configured to \
-                 authenticate against the proxy with"
-            );
-            std::process::exit(1);
-        };
-        let client = tools::bench::reqwest_like::Client::new(
-            proxy_url,
-            cred.access_key.clone(),
-            cred.secret_key.clone(),
+    };
+    if json {
+        println!("{}", tools::bench::backend_json(&results));
+    } else {
+        tools::bench::print_backend(&results);
+    }
+    let sweep = tools::bench::part_size_sweep(state, backend, bucket).await;
+    tools::bench::print_part_size_sweep(&sweep);
+    let concurrency = tools::bench::discover_concurrency(state, backend, bucket).await;
+    println!("max sustained concurrency (2x-latency knee): {concurrency}");
+}
+
+async fn run_proxy_tier(
+    state: &Arc<ProxyState>,
+    backend: &Backend,
+    bucket: &str,
+    proxy_url: &str,
+    json: bool,
+) {
+    // The proxy client speaks plain HTTP only (no TLS connector), so a
+    // non-http:// URL would silently time failed requests and report
+    // nonsense throughput. Reject it up front.
+    if !proxy_url.starts_with("http://") {
+        eprintln!("s3armor: bench --proxy must be an http:// URL (TLS to the proxy is not supported by this probe)");
+        std::process::exit(1);
+    }
+    // The proxy under test authenticates like any other S3 client —
+    // reuse the first registered `S3A_CLIENT_<NAME>` credential this
+    // `bench` process was configured with (the same env a real
+    // operator runs `bench` alongside the proxy with).
+    let Some(cred) = state.config.clients.values().next() else {
+        eprintln!(
+            "s3armor: bench --proxy: no S3A_CLIENT_<NAME>_ACCESS_KEY/_SECRET_KEY configured to \
+             authenticate against the proxy with"
         );
-        let results = tools::bench::run_proxy_vs_direct(&state, backend, &bucket, &client).await;
-        if args.json {
-            println!("{}", tools::bench::proxy_json(&results));
-        } else {
-            tools::bench::print_proxy_vs_direct(&results);
-        }
+        std::process::exit(1);
+    };
+    let client = tools::bench::reqwest_like::Client::new(
+        proxy_url.to_string(),
+        cred.access_key.clone(),
+        cred.secret_key.clone(),
+    );
+    let results = tools::bench::run_proxy_vs_direct(state, backend, bucket, &client).await;
+    if json {
+        println!("{}", tools::bench::proxy_json(&results));
+    } else {
+        tools::bench::print_proxy_vs_direct(&results);
     }
 }
 
