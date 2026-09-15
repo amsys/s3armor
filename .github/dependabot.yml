@@ -1,0 +1,8 @@
+# Dependabot checks cargo dependencies each week and opens update PRs.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
