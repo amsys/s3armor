@@ -85,6 +85,21 @@ fn parse_list_xml(xml: &str) -> Result<ListPage, ToolError> {
     reader.config_mut().trim_text_start = true;
     reader.config_mut().trim_text_end = true;
 
+    let (objects, next_token, is_truncated) = process_list_xml_events(&mut reader)?;
+
+    check_truncation_state(is_truncated, next_token.as_ref())?;
+    Ok(ListPage {
+        objects,
+        next_token: if is_truncated { next_token } else { None },
+    })
+}
+
+/// Process XML events from a list response. Extract objects, continuation
+/// token, and truncation flag from the event stream. Handles Start, Text, and
+/// End events to parse object keys and metadata fields.
+fn process_list_xml_events(
+    reader: &mut Reader<&[u8]>,
+) -> Result<(Vec<ListedObject>, Option<String>, bool), ToolError> {
     let mut objects = Vec::new();
     let mut next_token = None;
     let mut is_truncated = false;
@@ -98,11 +113,7 @@ fn parse_list_xml(xml: &str) -> Result<ListPage, ToolError> {
             .map_err(|e| ToolError::Xml(e.to_string()))?
         {
             Event::Start(e) => {
-                current_tag = e.name().as_ref().to_vec();
-                if current_tag == b"Contents" {
-                    in_contents = true;
-                    key = None;
-                }
+                handle_start_event(&e, &mut current_tag, &mut in_contents, &mut key);
             }
             Event::Text(t) => {
                 assign_list_field(
@@ -115,27 +126,61 @@ fn parse_list_xml(xml: &str) -> Result<ListPage, ToolError> {
                 );
             }
             Event::End(e) => {
-                if e.name().as_ref() == b"Contents" {
-                    in_contents = false;
-                    if let Some(k) = key.take() {
-                        objects.push(ListedObject { key: k });
-                    }
-                }
+                handle_end_event(&e, &mut in_contents, &mut key, &mut objects);
             }
             Event::Eof => break,
             _ => {}
         }
     }
+
+    Ok((objects, next_token, is_truncated))
+}
+
+/// Process a Start event. Set the current tag name and initialize object
+/// parsing when entering a Contents element.
+fn handle_start_event(
+    e: &quick_xml::events::BytesStart<'_>,
+    current_tag: &mut Vec<u8>,
+    in_contents: &mut bool,
+    key: &mut Option<String>,
+) {
+    current_tag.clear();
+    current_tag.extend_from_slice(e.name().as_ref());
+    if current_tag == b"Contents" {
+        *in_contents = true;
+        *key = None;
+    }
+}
+
+/// Process an End event. Finalize object parsing when exiting a Contents
+/// element and push the object to the result list.
+fn handle_end_event(
+    e: &quick_xml::events::BytesEnd<'_>,
+    in_contents: &mut bool,
+    key: &mut Option<String>,
+    objects: &mut Vec<ListedObject>,
+) {
+    if e.name().as_ref() == b"Contents" {
+        *in_contents = false;
+        if let Some(k) = key.take() {
+            objects.push(ListedObject { key: k });
+        }
+    }
+}
+
+/// Verify that truncation and continuation token state are consistent.
+/// Backends must include a continuation token if they report truncation.
+fn check_truncation_state(
+    is_truncated: bool,
+    next_token: Option<&String>,
+) -> Result<(), ToolError> {
     if is_truncated && next_token.is_none() {
         // Ending the walk here would report success over only the first page.
         return Err(ToolError::Backend(
             "backend reported truncation with no continuation token".to_string(),
         ));
     }
-    Ok(ListPage {
-        objects,
-        next_token: if is_truncated { next_token } else { None },
-    })
+    Ok(())
 }
 
 /// Decodes and unescapes an XML text event's raw bytes.
