@@ -39,11 +39,11 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use rand_core::{OsRng, RngCore};
 
-use s3armor_format::v1::{ciphertext_len, encrypt_all, Footer, ObjectMeta};
+use s3armor_format::v1::{ciphertext_len, encrypt_all, Alg, Footer, ObjectMeta};
 
 use crate::config::Backend;
 use crate::intercept::{header_u64, normalize_etag, set_response_header, write_binding};
-use crate::mpu::{CachedComplete, PartRecord, SessionKey};
+use crate::mpu::{CachedComplete, PartRecord, Session, SessionKey};
 use crate::proxy::body::{self, ProxyBody};
 use crate::proxy::error::S3Error;
 use crate::proxy::headers::to_pairs;
@@ -319,18 +319,6 @@ fn record_part(
 /// its own extra part), and complete. A retried Complete (real SDKs retry
 /// it) returns the cached response instead of `NoSuchUpload` — the session
 /// is never deleted here, only marked completed and left to expire by TTL.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one flat sequence: validate against the recorded session, seal the footer, upload/merge the tail, complete; splitting would fragment a single auditable path"
-)]
-#[expect(
-    clippy::indexing_slicing,
-    reason = "entry.parts[n] is only reached for n already validated present in entry.parts by the loop just above"
-)]
-#[expect(
-    clippy::expect_used,
-    reason = "client_parts.is_empty() is checked and returns early at the top of this function"
-)]
 pub async fn handle_complete(
     state: &ProxyState,
     backend: &Backend,
@@ -348,15 +336,8 @@ pub async fn handle_complete(
     // Look the session up before reading the body: an unknown uploadId must
     // fail fast, not after buffering a client-chosen amount. A retried
     // Complete returns its cached response without reading the body at all.
-    {
-        let entry = state
-            .sessions
-            .get(&session_key)
-            .ok_or_else(|| S3Error::no_such_upload(&upload_id))?;
-        if let Some(cached) = entry.completed.clone() {
-            drop(entry);
-            return Ok(cached_response(cached, request_id));
-        }
+    if let Some(resp) = cached_response_for_session(state, &session_key, &upload_id, request_id)? {
+        return Ok(resp);
     }
 
     let body_bytes = Limited::new(base_body, MAX_COMPLETE_XML_BYTES)
@@ -365,25 +346,9 @@ pub async fn handle_complete(
         .map_err(|e| S3Error::bad_gateway(format!("reading Complete body: {e}")))?
         .to_bytes();
     let client_parts = parse_complete_xml(&body_bytes)?;
-    if client_parts.is_empty() {
-        return Err(S3Error::invalid_part(
-            "CompleteMultipartUpload request lists no parts",
-        ));
-    }
-    // The sealed footer's format requires strictly ascending part numbers
-    // (`Footer::decode_record`) — reject here rather than sort, since the
-    // client's list order is what gets re-sent to the backend below via
-    // `build_complete_xml`.
-    if !parts_ascending(&client_parts) {
-        return Err(S3Error::invalid_part_order());
-    }
-    let last_number = client_parts
-        .iter()
-        .map(|(n, _)| *n)
-        .max()
-        .expect("checked non-empty above");
+    let last_number = validate_client_parts(&client_parts)?;
 
-    let (alg, dek, chunk_size, parts_snapshot, tail) = {
+    let snap = {
         let mut entry = state
             .sessions
             .get_mut(&session_key)
@@ -393,37 +358,166 @@ pub async fn handle_complete(
             drop(entry);
             return Ok(cached_response(cached, request_id));
         }
-        for (number, client_etag) in &client_parts {
-            let recorded = entry.parts.get(number).ok_or_else(|| {
-                S3Error::invalid_part(format!("part {number} was never uploaded"))
-            })?;
-            // Compare with surrounding quotes stripped on both sides: real
-            // S3 SDKs are inconsistent about whether the `<ETag>` they send
-            // back in the part list is quoted (`UploadPart`'s response
-            // header is always `"hex"`; the client is not required to
-            // preserve that literally).
-            if normalize_etag(&recorded.etag) != normalize_etag(client_etag) {
-                return Err(S3Error::invalid_part(format!(
-                    "part {number} ETag does not match what this node recorded"
-                )));
-            }
-        }
-        let parts_snapshot: Vec<(u32, u64)> = client_parts
-            .iter()
-            .map(|(n, _)| (*n, entry.parts[n].pt_len))
-            .collect();
-        let tail = entry.tails.get(&last_number).cloned();
-        (entry.alg, entry.dek, entry.chunk_size, parts_snapshot, tail)
+        snapshot_for_complete(&entry, &client_parts, last_number)?
     };
 
-    let total_pt: u64 = parts_snapshot.iter().map(|(_, size)| *size).sum();
-    // The last part not buffered: if it is still under S3's 5 MiB minimum,
-    // it was evicted from the capped tail buffer (or the client re-uses a
-    // part number in a way this node never buffered) — sealing the footer
-    // as its own extra part would turn this last part into a middle part
-    // and the backend would reject the whole upload with `EntityTooSmall`.
-    // Fail loudly instead of leaving that opaque error as the client's only
-    // signal.
+    let total_pt: u64 = snap.parts.iter().map(|(_, size)| *size).sum();
+    ensure_last_part_ok(
+        snap.tail.as_ref(),
+        &snap.parts,
+        last_number,
+        snap.alg,
+        snap.chunk_size,
+    )?;
+
+    // Claim the completion so a second concurrent Complete for this upload
+    // backs off instead of racing a duplicate footer upload (which would make
+    // the first Complete name an ETag the backend no longer holds). A retried
+    // sequential Complete still returns the cached response checked above.
+    if let Some(resp) = claim_completion(state, &session_key, &upload_id, request_id)? {
+        return Ok(resp);
+    }
+
+    let data = CompleteData {
+        client_parts,
+        last_number,
+        tail: snap.tail,
+        alg: snap.alg,
+        dek: snap.dek,
+        parts_snapshot: snap.parts,
+        total_pt,
+    };
+    let outcome = complete_upload(
+        state,
+        backend,
+        raw_path,
+        raw_query,
+        outbound_headers,
+        &session_key,
+        &upload_id,
+        data,
+        request_id,
+    )
+    .await;
+    // On failure, release the claim so a later retry can complete.
+    if outcome.is_err() {
+        if let Some(mut entry) = state.sessions.get_mut(&session_key) {
+            entry.completing = false;
+        }
+    }
+    outcome
+}
+
+/// Returns the cached response for an already-completed session (a retried
+/// Complete), or `None` to let the caller proceed with a fresh one.
+/// `NoSuchUpload` for an unknown id.
+fn cached_response_for_session(
+    state: &ProxyState,
+    session_key: &SessionKey,
+    upload_id: &str,
+    request_id: &str,
+) -> Result<Option<Response<ProxyBody>>, S3Error> {
+    let entry = state
+        .sessions
+        .get(session_key)
+        .ok_or_else(|| S3Error::no_such_upload(upload_id))?;
+    if let Some(cached) = entry.completed.clone() {
+        drop(entry);
+        return Ok(Some(cached_response(cached, request_id)));
+    }
+    Ok(None)
+}
+
+/// Checks the client's part list is non-empty and strictly ascending (the
+/// sealed footer's format requires this — `Footer::decode_record` — so
+/// `handle_complete` rejects rather than sorts, since the client's order is
+/// what gets re-sent to the backend via `build_complete_xml`), and returns
+/// the highest part number named.
+#[expect(
+    clippy::expect_used,
+    reason = "client_parts.is_empty() is checked and returns early above in this function"
+)]
+fn validate_client_parts(client_parts: &[(u32, String)]) -> Result<u32, S3Error> {
+    if client_parts.is_empty() {
+        return Err(S3Error::invalid_part(
+            "CompleteMultipartUpload request lists no parts",
+        ));
+    }
+    if !parts_ascending(client_parts) {
+        return Err(S3Error::invalid_part_order());
+    }
+    Ok(client_parts
+        .iter()
+        .map(|(n, _)| *n)
+        .max()
+        .expect("checked non-empty above"))
+}
+
+/// What `snapshot_for_complete` reads from the session under lock: what
+/// `handle_complete` needs to seal the footer.
+struct PartsSnapshot {
+    alg: Alg,
+    dek: [u8; 32],
+    chunk_size: u32,
+    parts: Vec<(u32, u64)>,
+    tail: Option<Bytes>,
+}
+
+/// Validates `client_parts` against what this node recorded on `entry`, then
+/// returns what `handle_complete` needs to seal the footer: the algorithm,
+/// DEK, chunk size, each part's plaintext size, and the buffered tail for
+/// the last part number (if any).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "entry.parts[n] is only reached for n already validated present in entry.parts by the loop just above"
+)]
+fn snapshot_for_complete(
+    entry: &Session,
+    client_parts: &[(u32, String)],
+    last_number: u32,
+) -> Result<PartsSnapshot, S3Error> {
+    for (number, client_etag) in client_parts {
+        let recorded = entry
+            .parts
+            .get(number)
+            .ok_or_else(|| S3Error::invalid_part(format!("part {number} was never uploaded")))?;
+        // Compare with surrounding quotes stripped on both sides: real S3
+        // SDKs are inconsistent about whether the `<ETag>` they send back in
+        // the part list is quoted (`UploadPart`'s response header is always
+        // `"hex"`; the client is not required to preserve that literally).
+        if normalize_etag(&recorded.etag) != normalize_etag(client_etag) {
+            return Err(S3Error::invalid_part(format!(
+                "part {number} ETag does not match what this node recorded"
+            )));
+        }
+    }
+    let parts_snapshot: Vec<(u32, u64)> = client_parts
+        .iter()
+        .map(|(n, _)| (*n, entry.parts[n].pt_len))
+        .collect();
+    let tail = entry.tails.get(&last_number).cloned();
+    Ok(PartsSnapshot {
+        alg: entry.alg,
+        dek: entry.dek,
+        chunk_size: entry.chunk_size,
+        parts: parts_snapshot,
+        tail,
+    })
+}
+
+/// The last part not buffered: if it is still under S3's 5 MiB minimum, it
+/// was evicted from the capped tail buffer (or the client re-uses a part
+/// number in a way this node never buffered) — sealing the footer as its
+/// own extra part would turn this last part into a middle part and the
+/// backend would reject the whole upload with `EntityTooSmall`. Fail loudly
+/// instead of leaving that opaque error as the client's only signal.
+fn ensure_last_part_ok(
+    tail: Option<&Bytes>,
+    parts_snapshot: &[(u32, u64)],
+    last_number: u32,
+    alg: Alg,
+    chunk_size: u32,
+) -> Result<(), S3Error> {
     if tail.is_none() {
         let last_pt_len = parts_snapshot
             .iter()
@@ -437,123 +531,194 @@ pub async fn handle_complete(
             )));
         }
     }
-    // Claim the completion so a second concurrent Complete for this upload
-    // backs off instead of racing a duplicate footer upload (which would make
-    // the first Complete name an ETag the backend no longer holds). A retried
-    // sequential Complete still returns the cached response checked above.
-    {
-        let mut entry = state
-            .sessions
-            .get_mut(&session_key)
-            .ok_or_else(|| S3Error::no_such_upload(&upload_id))?;
-        if let Some(cached) = entry.completed.clone() {
-            drop(entry);
-            return Ok(cached_response(cached, request_id));
-        }
-        if entry.completing {
-            return Err(S3Error::slow_down());
-        }
-        entry.completing = true;
+    Ok(())
+}
+
+/// Claims the completion for `session_key` so a second concurrent Complete
+/// backs off instead of racing a duplicate footer upload. Returns the
+/// cached response when a concurrent Complete already finished; the caller
+/// proceeds, with the claim held, only on `Ok(None)`.
+fn claim_completion(
+    state: &ProxyState,
+    session_key: &SessionKey,
+    upload_id: &str,
+    request_id: &str,
+) -> Result<Option<Response<ProxyBody>>, S3Error> {
+    let mut entry = state
+        .sessions
+        .get_mut(session_key)
+        .ok_or_else(|| S3Error::no_such_upload(upload_id))?;
+    if let Some(cached) = entry.completed.clone() {
+        drop(entry);
+        return Ok(Some(cached_response(cached, request_id)));
     }
+    if entry.completing {
+        return Err(S3Error::slow_down());
+    }
+    entry.completing = true;
+    drop(entry);
+    Ok(None)
+}
 
-    let outcome: Result<Response<ProxyBody>, S3Error> = async {
-        let footer = Footer {
-            alg,
-            parts: parts_snapshot,
-            total_pt,
-            md5: None,
-        };
-        let sealed_footer = footer.seal(&dek);
+/// What `complete_upload` needs beyond the plain proxy plumbing: the
+/// validated part list and what `snapshot_for_complete` read from the
+/// session under lock.
+struct CompleteData {
+    client_parts: Vec<(u32, String)>,
+    last_number: u32,
+    tail: Option<Bytes>,
+    alg: Alg,
+    dek: [u8; 32],
+    parts_snapshot: Vec<(u32, u64)>,
+    total_pt: u64,
+}
 
-        let mut final_parts = client_parts.clone();
-        if let Some(tail_ct) = tail {
-            let mut merged = tail_ct.to_vec();
-            merged.extend_from_slice(&sealed_footer);
-            let etag = upload_raw_part(
-                state,
-                backend,
-                raw_path,
-                &upload_id,
-                last_number,
-                Bytes::from(merged),
-            )
-            .await?;
-            for (n, e) in &mut final_parts {
-                if *n == last_number {
-                    e.clone_from(&etag);
-                }
-            }
+/// Seals the footer, uploads it (merged into the buffered tail, or as its
+/// own extra part), completes on the backend, and updates the session with
+/// the outcome.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one flat seal-upload-complete sequence: state, backend, path/query, headers, the session identity, the validated data, and request_id each need their own argument; splitting would fragment a single auditable path"
+)]
+async fn complete_upload(
+    state: &ProxyState,
+    backend: &Backend,
+    raw_path: &str,
+    raw_query: &str,
+    outbound_headers: Vec<(String, String)>,
+    session_key: &SessionKey,
+    upload_id: &str,
+    data: CompleteData,
+    request_id: &str,
+) -> Result<Response<ProxyBody>, S3Error> {
+    let CompleteData {
+        client_parts,
+        last_number,
+        tail,
+        alg,
+        dek,
+        parts_snapshot,
+        total_pt,
+    } = data;
+    let footer = Footer {
+        alg,
+        parts: parts_snapshot,
+        total_pt,
+        md5: None,
+    };
+    let sealed_footer = footer.seal(&dek);
+
+    let final_parts = finalize_parts(
+        state,
+        backend,
+        raw_path,
+        upload_id,
+        last_number,
+        tail,
+        client_parts,
+        sealed_footer,
+    )
+    .await?;
+
+    let complete_xml = build_complete_xml(&final_parts);
+    let mut complete_headers = outbound_headers;
+    set_header(
+        &mut complete_headers,
+        "content-length",
+        &complete_xml.len().to_string(),
+    );
+    let backend_resp = forward(
+        state,
+        backend,
+        "POST",
+        raw_path,
+        raw_query,
+        complete_headers,
+        body::full(Bytes::from(complete_xml)),
+    )
+    .await?;
+    let (parts, incoming) = backend_resp.into_parts();
+    let out_bytes = incoming
+        .collect()
+        .await
+        .map_err(|e| S3Error::bad_gateway(format!("reading Complete response: {e}")))?
+        .to_bytes();
+
+    if let Some(mut entry) = state.sessions.get_mut(session_key) {
+        if parts.status.is_success() {
+            entry.completed = Some(CachedComplete {
+                status: parts.status,
+                headers: to_pairs(&parts.headers),
+                body: out_bytes.clone(),
+            });
+            entry.touch();
         } else {
-            let footer_number = last_number
-                .checked_add(1)
-                .ok_or_else(|| S3Error::bad_gateway("multipart part numbers exhausted"))?;
-            let etag = upload_raw_part(
-                state,
-                backend,
-                raw_path,
-                &upload_id,
-                footer_number,
-                Bytes::from(sealed_footer),
-            )
-            .await?;
-            final_parts.push((footer_number, etag));
-        }
-
-        let complete_xml = build_complete_xml(&final_parts);
-        let mut complete_headers = outbound_headers;
-        set_header(
-            &mut complete_headers,
-            "content-length",
-            &complete_xml.len().to_string(),
-        );
-        let backend_resp = forward(
-            state,
-            backend,
-            "POST",
-            raw_path,
-            raw_query,
-            complete_headers,
-            body::full(Bytes::from(complete_xml)),
-        )
-        .await?;
-        let (parts, incoming) = backend_resp.into_parts();
-        let out_bytes = incoming
-            .collect()
-            .await
-            .map_err(|e| S3Error::bad_gateway(format!("reading Complete response: {e}")))?
-            .to_bytes();
-
-        if let Some(mut entry) = state.sessions.get_mut(&session_key) {
-            if parts.status.is_success() {
-                entry.completed = Some(CachedComplete {
-                    status: parts.status,
-                    headers: to_pairs(&parts.headers),
-                    body: out_bytes.clone(),
-                });
-                entry.touch();
-            } else {
-                // `forward` returns Ok for any backend HTTP status, so a
-                // non-2xx Complete (e.g. a transient 503) reaches here as a
-                // success `outcome` and would leave `completing` stuck true,
-                // wedging every retry until TTL. Release the claim so the
-                // client can retry.
-                entry.completing = false;
-            }
-        }
-        Ok(build_client_response(
-            parts,
-            body::full(out_bytes),
-            request_id,
-        ))
-    }
-    .await;
-    // On failure, release the claim so a later retry can complete.
-    if outcome.is_err() {
-        if let Some(mut entry) = state.sessions.get_mut(&session_key) {
+            // `forward` returns Ok for any backend HTTP status, so a
+            // non-2xx Complete (e.g. a transient 503) reaches here as a
+            // success `outcome` and would leave `completing` stuck true,
+            // wedging every retry until TTL. Release the claim so the
+            // client can retry.
             entry.completing = false;
         }
     }
-    outcome
+    Ok(build_client_response(
+        parts,
+        body::full(out_bytes),
+        request_id,
+    ))
+}
+
+/// Merges the sealed footer into the buffered tail for `last_number` when
+/// present, else uploads it as its own extra part. Either way, returns the
+/// client's part list with the ETag for that part number updated to what
+/// actually landed on the backend.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one flat merge-or-upload sequence: state, backend, path, the target part, and the two footer-placement inputs each need their own argument; splitting would fragment a single auditable path"
+)]
+async fn finalize_parts(
+    state: &ProxyState,
+    backend: &Backend,
+    raw_path: &str,
+    upload_id: &str,
+    last_number: u32,
+    tail: Option<Bytes>,
+    mut final_parts: Vec<(u32, String)>,
+    sealed_footer: Vec<u8>,
+) -> Result<Vec<(u32, String)>, S3Error> {
+    if let Some(tail_ct) = tail {
+        let mut merged = tail_ct.to_vec();
+        merged.extend_from_slice(&sealed_footer);
+        let etag = upload_raw_part(
+            state,
+            backend,
+            raw_path,
+            upload_id,
+            last_number,
+            Bytes::from(merged),
+        )
+        .await?;
+        for (n, e) in &mut final_parts {
+            if *n == last_number {
+                e.clone_from(&etag);
+            }
+        }
+    } else {
+        let footer_number = last_number
+            .checked_add(1)
+            .ok_or_else(|| S3Error::bad_gateway("multipart part numbers exhausted"))?;
+        let etag = upload_raw_part(
+            state,
+            backend,
+            raw_path,
+            upload_id,
+            footer_number,
+            Bytes::from(sealed_footer),
+        )
+        .await?;
+        final_parts.push((footer_number, etag));
+    }
+    Ok(final_parts)
 }
 
 async fn upload_raw_part(
