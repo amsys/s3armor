@@ -71,7 +71,7 @@ async fn setup_with(
     testcontainers::ContainerAsync<GenericImage>,
     Arc<ProxyState>,
 ) {
-    let minio = GenericImage::new("minio/minio", "latest")
+    let minio = GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
         .with_exposed_port(9000.tcp())
         .with_wait_for(WaitFor::message_on_stderr("API:"))
         .with_env_var("MINIO_ROOT_USER", "minioadmin")
