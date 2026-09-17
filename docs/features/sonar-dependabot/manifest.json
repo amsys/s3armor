@@ -1,0 +1,114 @@
+{
+  "goal": "SonarCloud shows no open S3776 CRITICAL issues for amsys_s3armor after the next push, and Dependabot opens update PRs for cargo.",
+  "unknowns": [
+    {
+      "text": "Dependabot: user chose cargo only (no github-actions ecosystem).",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "The 4 rust:S3329 findings in crates/s3armor-format/tests are false positives (flagged argument is part_number; frame nonces are random). User marks them False Positive in the Sonar UI; no repo change.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "Local clippy (threshold 15) does not reproduce Sonar S3776 counts. Refactors are verified by tests + clippy + inspection; the Sonar result is only visible after a push the user makes.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "Executors share one working tree. Code steps are chained sequentially to avoid the shared-tree clobber seen in earlier parallel runs.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "Run 1 (2026-09-15): the done check could never pass here. integration_minio.rs and integration_mpu.rs need Docker, and user martin lacks docker group access; a clean HEAD fails the same way. The user chose to exclude them locally; the full suite runs in CI or by hand before push.",
+      "resolve": "assume-and-flag"
+    }
+  ],
+  "success_criteria": [
+    "cargo test -p s3armor --locked --lib --bins --test conformance passes (Docker suites run in CI or by hand before push)",
+    "cargo test -p s3armor-format --locked passes",
+    "cargo clippy --workspace --all-targets --locked -- -D warnings passes",
+    "cargo fmt --check passes",
+    "Each of the 6 S3776 functions is split so its cognitive complexity is 15 or less by Sonar's counting rules (inspection; confirmed by the next Sonar scan)",
+    ".github/dependabot.yml parses and lists only the cargo ecosystem"
+  ],
+  "scope_fence": [
+    "No change to the v1 wire format, crypto primitives, or nonce generation",
+    "No behavior change in any refactored function: extract helpers only",
+    "No change to clippy.toml thresholds or [workspace.lints]",
+    "No change to sonar-project.properties or any test file",
+    "No push, no Sonar UI changes, no dependency version bumps in this run"
+  ],
+  "registration_files": [],
+  "budget": {
+    "escalations_max": 2
+  },
+  "steps": [
+    {
+      "id": "dependabot",
+      "action": "Create .github/dependabot.yml with version 2 and one updates entry: package-ecosystem cargo, directory /, schedule interval weekly, open-pull-requests-limit 5. Add a one-line STE comment on top.",
+      "files": [
+        ".github/dependabot.yml"
+      ],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "CI config: controls automated PRs against the repo.",
+      "done_check": "python3 -c \"import yaml; d=yaml.safe_load(open('.github/dependabot.yml')); assert d['version']==2; assert [u['package-ecosystem'] for u in d['updates']]==['cargo']; print('ok')\""
+    },
+    {
+      "id": "refactor-list",
+      "action": "Split parse_list_xml in crates/s3armor/src/tools/list.rs (Sonar S3776: 17) into helpers so each function has cognitive complexity 15 or less. Extract only; keep behavior.",
+      "files": [
+        "crates/s3armor/src/tools/list.rs"
+      ],
+      "depends_on": [
+        "dependabot"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "local",
+      "reason": "Single parser function with its own tests.",
+      "done_check": "cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test -p s3armor --locked --lib --bins --test conformance && cargo test -p s3armor-format --locked"
+    },
+    {
+      "id": "refactor-main",
+      "action": "Split run_bench in crates/s3armor/src/main.rs (Sonar S3776: 17) into helpers so each function has cognitive complexity 15 or less. Extract only; keep output and exit codes.",
+      "files": [
+        "crates/s3armor/src/main.rs"
+      ],
+      "depends_on": [
+        "refactor-list"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "local",
+      "reason": "CLI bench entry point, no data path.",
+      "done_check": "cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test -p s3armor --locked --lib --bins --test conformance && cargo test -p s3armor-format --locked"
+    },
+    {
+      "id": "refactor-mpu",
+      "action": "Split handle_complete in crates/s3armor/src/intercept/mpu.rs (Sonar S3776: 26) into helpers so each function has cognitive complexity 15 or less. Extract only; keep part validation order, error mapping, and the existing #[expect] invariant true at its site.",
+      "files": [
+        "crates/s3armor/src/intercept/mpu.rs"
+      ],
+      "depends_on": [
+        "refactor-main"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "CompleteMultipartUpload writes the encrypted object manifest; a reordered check corrupts stored data.",
+      "done_check": "cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test -p s3armor --locked --lib --bins --test conformance && cargo test -p s3armor-format --locked"
+    },
+    {
+      "id": "refactor-body",
+      "action": "Split hashing (19), decrypting_range (29) and decrypting_multipart_range (20) in crates/s3armor/src/proxy/body.rs into helpers so each function has cognitive complexity 15 or less. Extract only; keep verify-before-release order, error propagation as typed S3 errors, and client-disconnect stop behavior.",
+      "files": [
+        "crates/s3armor/src/proxy/body.rs"
+      ],
+      "depends_on": [
+        "refactor-mpu"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "Decrypt and hash-verify streaming path: releasing a chunk before verification leaks unauthenticated plaintext.",
+      "done_check": "cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test -p s3armor --locked --lib --bins --test conformance && cargo test -p s3armor-format --locked"
+    }
+  ]
+}

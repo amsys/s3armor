@@ -1,0 +1,50 @@
+{
+  "goal": "A global rule in orchestein src/domain/RULES.md says Docker is invoked with sudo, and the s3armor Docker integration suites (integration_minio, integration_mpu) run under that rule with an observed pass/fail result.",
+  "unknowns": [
+    {
+      "id": "u1",
+      "text": "sudo asks for a password (only named helpers are NOPASSWD). How does the test run get root?",
+      "resolve": "ask"
+    },
+    {
+      "id": "u2",
+      "text": "testcontainers opens /var/run/docker.sock (root:docker 0660) directly, so the test binary itself must run as root, not only a docker CLI call.",
+      "resolve": "assume-and-flag"
+    }
+  ],
+  "success_criteria": [
+    "grep -n '^14\\. Docker' /home/martin/work/orchestein/src/domain/RULES.md prints one line",
+    "cargo test -p s3armor --test integration_minio --test integration_mpu --no-run exits 0 as user martin",
+    "the two test binaries run under sudo and print a 'test result:' line each"
+  ],
+  "scope_fence": [
+    "no change to s3armor source or tests",
+    "no change to /etc/sudoers.d, the docker socket permissions, or group membership",
+    "no sudo cargo (target/ stays user-owned)",
+    "no other orchestein file; src has unrelated uncommitted work, do not commit it"
+  ],
+  "registration_files": [],
+  "budget": { "escalations_max": 2 },
+  "steps": [
+    {
+      "id": "s1",
+      "action": "Append rule 14 to /home/martin/work/orchestein/src/domain/RULES.md: Docker runs through sudo; martin is not in the docker group and is not to be added; never chmod or setfacl the socket; sudo needs a password so an agent hands the user the exact `! sudo ...` command; for testcontainers suites build as the user (`cargo test --no-run`) and run only the built test binary under sudo, never `sudo cargo`. Use STE wording and the file's banned-vocabulary list.",
+      "files": ["/home/martin/work/orchestein/src/domain/RULES.md"],
+      "depends_on": [],
+      "reversibility": "trivial",
+      "blast_radius": "system",
+      "reason": "Loaded into every Claude session on the machine; a wrong rule misroutes all Docker work.",
+      "done_check": "grep -n '^14\\. Docker' /home/martin/work/orchestein/src/domain/RULES.md"
+    },
+    {
+      "id": "s2",
+      "action": "Build the Docker integration test binaries as user martin and print their paths, then run each under sudo per rule 14.",
+      "files": [],
+      "depends_on": ["s1"],
+      "reversibility": "trivial",
+      "blast_radius": "system",
+      "reason": "Runs as root against the host Docker daemon; containers are removed on drop.",
+      "done_check": "cd /home/martin/work/s3armor && cargo test -p s3armor --test integration_minio --test integration_mpu --no-run 2>&1 | grep Executable"
+    }
+  ]
+}

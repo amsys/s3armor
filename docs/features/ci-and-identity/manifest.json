@@ -1,0 +1,132 @@
+{
+  "goal": "s3armor CI is green on main, every commit identity is Martin <dev@amsys.cz>, and commits are SSH-signed by default in all repos.",
+  "registration_files": [],
+  "scope_fence": [
+    "No force-push to origin. Remote main is 5 commits behind local and holds no tags, so a normal push suffices.",
+    "No change to crypto, format, sigv4 or proxy logic. CI fixes touch dependency pins and test image references only.",
+    "No edit to ~/.config/git/config (symlink into mango-dotfiles). config.local is a real untracked file and is in scope."
+  ],
+  "unknowns": [
+    {
+      "id": "U1",
+      "text": "What to do with the local tag backup-before-squash (65 commits authored martin@its.mu, not on origin)?",
+      "resolve": "ask"
+    },
+    {
+      "id": "U2",
+      "text": "files_set_target has no donation page, FUNDING.yml, sponsor link or <donation> element. What is the reference?",
+      "resolve": "ask"
+    },
+    {
+      "id": "U3",
+      "text": "id_ed25519_amsys_sign is passphrase-protected and absent from the running ssh-agent. KeePassXC must load it; that is a GUI step the session cannot do.",
+      "resolve": "assume-and-flag"
+    }
+  ],
+  "success_criteria": [
+    "git log --all --format='%an <%ae>|%cn <%ce>' | sort -u prints only 'Martin <dev@amsys.cz>|Martin <dev@amsys.cz>'",
+    "grep -rn 'its\\.mu' --exclude-dir=.git . returns nothing",
+    "git config --global commit.gpgsign is true and gpg.format is ssh",
+    "git log --show-signature -1 reports a good signature for dev@amsys.cz",
+    "cargo deny check advisories exits 0",
+    "gh run list --limit 1 on the pushed head shows CI success"
+  ],
+  "budget": { "escalations_max": 2 },
+  "steps": [
+    {
+      "id": "S1",
+      "action": "Set email to dev@amsys.cz in ~/.config/git/config.local",
+      "files": ["/home/martin/.config/git/config.local"],
+      "depends_on": [],
+      "reversibility": "trivial",
+      "blast_radius": "local",
+      "reason": "Untracked local identity file still carries martin@its.mu. ~/.gitconfig currently overrides it, so nothing is broken today, but it is the last live source of the old address.",
+      "done_check": "grep -c 'dev@amsys.cz' /home/martin/.config/git/config.local"
+    },
+    {
+      "id": "S2",
+      "action": "Change the vulnerability-report contact in SECURITY.md to dev@amsys.cz",
+      "files": ["SECURITY.md"],
+      "depends_on": [],
+      "reversibility": "trivial",
+      "blast_radius": "local",
+      "reason": "Only in-tree occurrence of martin@its.mu.",
+      "done_check": "! grep -rn 'its\\.mu' --exclude-dir=.git --exclude-dir=target /home/martin/work/s3armor"
+    },
+    {
+      "id": "S3",
+      "action": "Set gpg.format=ssh, user.signingkey=~/.ssh/id_ed25519_amsys_sign.pub, commit.gpgsign=true, tag.gpgsign=true in ~/.gitconfig",
+      "files": ["/home/martin/.gitconfig"],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "Global signing default for every repo on the machine. allowedSignersFile already names the dev@amsys.cz key, so verification works once the key is in the agent.",
+      "done_check": "test \"$(git config --global commit.gpgsign)\" = true && test \"$(git config --global gpg.format)\" = ssh"
+    },
+    {
+      "id": "S4",
+      "action": "Point minio/minio at quay.io/minio/minio and pin tag RELEASE.2025-09-07T16-13-09Z in both integration tests and both compose files",
+      "files": [
+        "crates/s3armor/tests/integration_minio.rs",
+        "crates/s3armor/tests/integration_mpu.rs",
+        "docker-compose.yml",
+        "docker-compose.e2e.yml"
+      ],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "module",
+      "reason": "Docker Hub minio/minio now returns 404 (verified by API probe). quay.io is MinIO's live registry. Pinning a release tag also stops a repeat of this class of break.",
+      "done_check": "! grep -rn '\"minio/minio\"' crates && ! grep -rn 'image: minio/minio' docker-compose.yml docker-compose.e2e.yml"
+    },
+    {
+      "id": "S5",
+      "action": "cargo update -p rustls to >=0.23.45 to clear RUSTSEC GHSA-2mjx-qc3c-rqvc",
+      "files": ["Cargo.lock"],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "module",
+      "reason": "cargo-deny advisories FAILED on rustls 0.23.43. The advisory names >=0.23.45 as the fix.",
+      "done_check": "cargo deny check advisories"
+    },
+    {
+      "id": "S6",
+      "action": "Run the workspace test suite to confirm the CI failures are gone locally",
+      "files": [],
+      "depends_on": ["S4", "S5"],
+      "reversibility": "trivial",
+      "blast_radius": "local",
+      "reason": "CI is the only place these two tests ran. Verify before push, not after.",
+      "done_check": "cargo nextest run --workspace --locked -E 'not test(/integration_/)'"
+    },
+    {
+      "id": "S7",
+      "action": "Re-sign the last commit 05d94d0 with --amend --no-edit -S",
+      "files": [],
+      "depends_on": ["S3"],
+      "reversibility": "cheap",
+      "blast_radius": "local",
+      "reason": "Unpushed commit, so the amend rewrites nothing anyone else has.",
+      "done_check": "git log --show-signature -1"
+    },
+    {
+      "id": "S8",
+      "action": "Rewrite the backup-before-squash tag history to Martin <dev@amsys.cz>",
+      "files": [],
+      "depends_on": [],
+      "reversibility": "irreversible",
+      "blast_radius": "local",
+      "reason": "65 commits reachable only from this local tag still carry martin@its.mu. It is the only thing blocking success criterion 1. Gated because a filter rewrite cannot be undone once the old objects are pruned.",
+      "done_check": "git log --all --format='%ae' | sort -u"
+    },
+    {
+      "id": "S9",
+      "action": "Push main to origin (fast-forward, no force)",
+      "files": [],
+      "depends_on": ["S6", "S7"],
+      "reversibility": "irreversible",
+      "blast_radius": "external",
+      "reason": "Publishes to GitHub and starts a CI run. Rule 6 requires an explicit yes for any push.",
+      "done_check": "git rev-parse HEAD and git rev-parse origin/main match, then gh run list --limit 1"
+    }
+  ]
+}
