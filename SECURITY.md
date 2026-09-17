@@ -4,7 +4,7 @@
 
 Do not open a public issue for a security problem. Report it privately:
 
-- Email: <martin@its.mu>
+- Email: <dev@amsys.cz>
 - Or use GitHub's private vulnerability reporting on this repository
   ("Security" tab → "Report a vulnerability"), if enabled.
 
