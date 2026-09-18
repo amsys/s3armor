@@ -134,7 +134,9 @@ jobs:
     # A fork PR has no access to secrets.SONAR_TOKEN, so it would run this
     # job only to fail a required check the contributor cannot fix. Skip it
     # there; it still runs on every push and every same-repo PR.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Dependabot PRs also get no Actions secrets, so the job is skipped
+    # there too; it scans the merge on main.
+    if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     steps:
       - uses: actions/checkout@v4
         with:
