@@ -6,3 +6,17 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # These crates must move to digest 0.11 together with rsa. rsa 0.9
+    # uses digest 0.10. Our OAEP key wrap uses Sha256 through it. Remove
+    # this ignore when rsa 0.10 is stable.
+    ignore:
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "hkdf"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "md-5"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "aes-gcm"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
