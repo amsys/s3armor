@@ -47,7 +47,7 @@ start_minio() {
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" -p "$port:9000" \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-    minio/minio server /data >/dev/null
+    quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null
   for _ in $(seq 1 30); do
     curl -sf "http://127.0.0.1:$port/minio/health/live" >/dev/null 2>&1 && return 0
     sleep 1

@@ -58,7 +58,7 @@ docker network rm "$NETWORK" >/dev/null 2>&1 || true
 docker network create "$NETWORK" >/dev/null
 docker run -d --name "$MINIO_CONTAINER" --network "$NETWORK" -p "$MINIO_PORT:9000" \
   -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  minio/minio server /data >/dev/null
+  quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null
 for _ in $(seq 1 30); do
   curl -sf "http://127.0.0.1:$MINIO_PORT/minio/health/live" >/dev/null 2>&1 && break
   sleep 1

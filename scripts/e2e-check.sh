@@ -145,7 +145,7 @@ echo "== the actual product promise: ciphertext at rest, direct to MinIO =="
 BACKEND_SECRET="$(cat "$ROOT/secrets-e2e/backend_secret")"
 mkdir -p "$WORKDIR/candidates"
 CIPHERTEXT_CHECK="$(docker run --rm --network "s3a-e2e-check_default" -v "$WORKDIR/candidates:/out" \
-  --entrypoint sh minio/minio -c "
+  --entrypoint sh quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z -c "
   set -e
   mc alias set m http://minio:9000 minioadmin '$BACKEND_SECRET' >/dev/null
   found=0
