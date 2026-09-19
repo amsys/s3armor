@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/s3armor-format", "crates/s3armor"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.97"
 license = "AGPL-3.0-or-later"
