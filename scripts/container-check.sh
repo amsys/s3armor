@@ -50,7 +50,7 @@ WORKDIR="$(mktemp -d)"
 mkdir -p "$WORKDIR/secrets"
 
 echo "== building $IMAGE from the Containerfile default target =="
-docker build -t "$IMAGE" "$ROOT"
+docker build -f "$ROOT/Containerfile" -t "$IMAGE" "$ROOT"
 
 echo "== starting MinIO on :$MINIO_PORT =="
 docker rm -f "$MINIO_CONTAINER" >/dev/null 2>&1 || true

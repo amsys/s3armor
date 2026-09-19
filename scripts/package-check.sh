@@ -29,10 +29,10 @@ esac
 # nfpm version pinned for reproducibility.
 NFPM_VERSION="v2.35.0"
 
-# Read the s3armor version from Cargo.toml via cargo metadata.
-# Use sed to parse JSON; no external JSON parsing tool dependency.
-VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" \
-  | sed -n 's/.*"packages":\[\s*{\s*"name":"s3armor".*"version":"\([^"]*\)".*/\1/p' | head -1)"
+# Read the s3armor version from cargo. `cargo pkgid` ends in "#<version>"
+# (or "@<version>" when the package name differs from the path).
+PKGID="$(cargo pkgid --manifest-path "$ROOT/Cargo.toml" -p s3armor)"
+VERSION="${PKGID##*[#@]}"
 [ -n "$VERSION" ] || {
   echo "package-check: cannot read s3armor version from Cargo.toml" >&2
   exit 1
@@ -58,7 +58,7 @@ done
 mkdir -p "$DIST_DIR"
 
 echo "== building static binary for $ARCH with docker buildx =="
-docker buildx build --target binary --output "type=local,dest=$DIST_DIR" "$ROOT"
+docker buildx build -f "$ROOT/Containerfile" --target binary --output "type=local,dest=$DIST_DIR" "$ROOT"
 [ -f "$BINARY" ] || {
   echo "package-check: docker buildx did not produce $BINARY" >&2
   exit 1
@@ -68,13 +68,11 @@ echo "== building .deb and .apk packages with nfpm =="
 docker run --rm -v "$ROOT:/src" -w /src \
   -e "VERSION=$VERSION" \
   -e "ARCH=$ARCH" \
-  -e "BINARY=$BINARY" \
   "goreleaser/nfpm:${NFPM_VERSION}" package -f packaging/nfpm.yaml -p deb -t dist/
 
 docker run --rm -v "$ROOT:/src" -w /src \
   -e "VERSION=$VERSION" \
   -e "ARCH=$ARCH" \
-  -e "BINARY=$BINARY" \
   "goreleaser/nfpm:${NFPM_VERSION}" package -f packaging/nfpm.yaml -p apk -t dist/
 
 # Find the built packages.
@@ -91,6 +89,7 @@ APK="$(find "$DIST_DIR" -maxdepth 1 -name 's3armor_*.apk' -print -quit)"
 
 echo "== testing .deb install on debian:12 =="
 docker run --rm -v "$DIST_DIR:/dist:ro" debian:12 bash -c "
+  set -e
   dpkg -i /dist/$(basename "$DEB")
   s3armor --version | grep -q '$VERSION' || { echo 'Version mismatch on debian:12'; exit 1; }
   test -f /usr/lib/systemd/system/s3armor.service || { echo 'Service file missing on debian:12'; exit 1; }
@@ -100,6 +99,7 @@ docker run --rm -v "$DIST_DIR:/dist:ro" debian:12 bash -c "
 
 echo "== testing .deb install on debian:13 =="
 docker run --rm -v "$DIST_DIR:/dist:ro" debian:13 bash -c "
+  set -e
   dpkg -i /dist/$(basename "$DEB")
   s3armor --version | grep -q '$VERSION' || { echo 'Version mismatch on debian:13'; exit 1; }
   test -f /usr/lib/systemd/system/s3armor.service || { echo 'Service file missing on debian:13'; exit 1; }
@@ -109,6 +109,7 @@ docker run --rm -v "$DIST_DIR:/dist:ro" debian:13 bash -c "
 
 echo "== testing .apk install on alpine:3 =="
 docker run --rm -v "$DIST_DIR:/dist:ro" alpine:3 ash -c "
+  set -e
   apk add --allow-untrusted /dist/$(basename "$APK")
   s3armor --version | grep -q '$VERSION' || { echo 'Version mismatch on alpine:3'; exit 1; }
   test -f /etc/init.d/s3armor || { echo 'Init script missing on alpine:3'; exit 1; }

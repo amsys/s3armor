@@ -4,11 +4,12 @@
 #
 # Build with the pinned nfpm container image, one run per format:
 #   docker run --rm -v "$PWD:/src" -w /src \
-#     -e VERSION -e ARCH -e BINARY \
+#     -e VERSION -e ARCH \
 #     goreleaser/nfpm:<pinned version> package -f packaging/nfpm.yaml -p deb -t dist/
 # ARCH is "amd64" or "arm64". VERSION is the Cargo package version.
-# BINARY is the path to the static binary that scripts/package-check.sh
-# exports with `docker buildx build --target binary`.
+# The binary comes from dist/s3armor, relative to the repo root. That is
+# where `docker buildx build --target binary` exports it. nfpm does not
+# expand environment variables in contents.src, so the path is fixed.
 name: s3armor
 arch: ${ARCH}
 platform: linux
@@ -25,7 +26,7 @@ homepage: https://github.com/amsys/s3armor
 license: AGPL-3.0-or-later
 
 contents:
-  - src: ${BINARY}
+  - src: dist/s3armor
     dst: /usr/bin/s3armor
     file_info:
       mode: 0755
