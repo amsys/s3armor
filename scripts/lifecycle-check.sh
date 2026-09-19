@@ -26,6 +26,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 MINIO_CONTAINER="s3a-lifecycle-check-minio"
 MINIO_PORT=19206
 PROXY_PORT=18287
@@ -77,7 +79,7 @@ start_s3armor() {
   S3A_KEY_LIFECYCLECHECK="$TEST_KEY_B64" \
   S3A_CLIENT_CHECK_ACCESS_KEY=checkkey \
   S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
-    env "$@" "$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3armor.log" 2>&1 &
+    env "$@" "$S3ARMOR" serve >"$WORKDIR/s3armor.log" 2>&1 &
   S3A_PID=$!
   for _ in $(seq 1 30); do
     curl -sf "$PROXY_URL/health" >/dev/null 2>&1 && return 0
@@ -177,7 +179,7 @@ S3A_BACKEND_SECRET_KEY=minioadmin \
 S3A_KEY_ACTIVE=LIFECYCLECHECK \
 S3A_KEY_LIFECYCLECHECK="$TEST_KEY_B64" \
 S3A_BIND_PATHS=strict \
-  "$ROOT/target/debug/s3armor" rebind --bucket "$BUCKET"
+  "$S3ARMOR" rebind --bucket "$BUCKET"
 
 aws --endpoint-url "$PROXY_URL" s3api get-object --bucket "$BUCKET" --key strict-me.bin \
   "$WORKDIR/rebound.bin" >/dev/null
@@ -211,7 +213,7 @@ S3A_KEY_LIFECYCLECHECK="$TEST_KEY_B64" \
 S3A_CLIENT_CHECK_ACCESS_KEY=checkkey \
 S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
 S3A_TIMEOUT_CONNECT=2 \
-  "$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3a-timeout.log" 2>&1 &
+  "$S3ARMOR" serve >"$WORKDIR/s3a-timeout.log" 2>&1 &
 S3A_PID=$!
 for _ in $(seq 1 30); do
   curl -sf "$PROXY_URL/health" >/dev/null 2>&1 && break

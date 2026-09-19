@@ -16,6 +16,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 MINIO_A="s3a-multi-backend-check-minio-a"
 MINIO_B="s3a-multi-backend-check-minio-b"
 MINIO_A_PORT=19120
@@ -77,7 +79,7 @@ S3A_CLIENT_BRAVO_SECRET_KEY=bravosecret1234567890 \
 S3A_CLIENT_BRAVO_BACKEND=BRAVO \
 S3A_KEY_ACTIVE=MBCHECK \
 S3A_KEY_MBCHECK="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" \
-"$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3armor.log" 2>&1 &
+"$S3ARMOR" serve >"$WORKDIR/s3armor.log" 2>&1 &
 S3A_PID=$!
 for _ in $(seq 1 30); do
   curl -sf "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break

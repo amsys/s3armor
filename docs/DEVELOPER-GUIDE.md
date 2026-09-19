@@ -148,6 +148,14 @@ stands in for it.
 | `scripts/conditional-check.sh` | Conditional requests (`If-Match`/`If-None-Match`): a plaintext-checksum PUT, `aws-cli`'s own conditional get-object flags, and a raw `curl` conditional header, each checked against the exact HTTP status returned. |
 | `scripts/lifecycle-check.sh` | Graceful drain, `/ready`, `S3A_TIMEOUT_CONNECT`, and `S3A_BIND_PATHS=strict` plus `rebind` — against the real compiled binary: SIGTERM sent mid-upload flips `/health` to 503 immediately while the in-flight PUT still completes, then the process exits on its own once drained. |
 
+Each script sources `scripts/common.sh` after setting `ROOT`. On a machine
+where Docker requires sudo, run `DOCKER="sudo docker" scripts/<name>.sh` —
+cargo runs as your user, only docker uses sudo. Do not run the script
+itself under sudo; cargo would write root-owned files to the build
+directory. Scripts find the s3armor binary through `cargo metadata`, so
+any target directory set by `CARGO_TARGET_DIR` or by `build.target-dir` in
+a cargo config works.
+
 None of these scripts run in CI (see [section 10](#10-continuous-integration)).
 Run them locally before a change that touches proxying, crypto, multipart,
 tooling, TLS, bind-path binding, the compose stack, conditional requests, or

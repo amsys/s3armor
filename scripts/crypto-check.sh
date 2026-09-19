@@ -9,6 +9,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 MINIO_CONTAINER="s3a-crypto-check-minio"
 MINIO_PORT=19101
 PROXY_PORT=18181
@@ -52,7 +54,7 @@ S3A_CLIENT_CHECK_ACCESS_KEY=checkkey \
 S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
 S3A_KEY_ACTIVE=CRYPTOCHECK \
 S3A_KEY_CRYPTOCHECK="$TEST_KEY_B64" \
-"$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3armor.log" 2>&1 &
+"$S3ARMOR" serve >"$WORKDIR/s3armor.log" 2>&1 &
 S3A_PID=$!
 for _ in $(seq 1 30); do
   curl -sf "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break

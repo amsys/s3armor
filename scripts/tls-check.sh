@@ -9,6 +9,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 MINIO_CONTAINER="s3a-tls-check-minio"
 MINIO_PORT=19203
 PROXY_PORT=18283
@@ -66,7 +68,7 @@ S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
 S3A_TLS_CERT="$WORKDIR/cert.pem" \
 S3A_TLS_KEY="$WORKDIR/key.pem" \
 S3A_AUTH_FAIL_LIMIT=3 \
-  "$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3armor.log" 2>&1 &
+  "$S3ARMOR" serve >"$WORKDIR/s3armor.log" 2>&1 &
 S3A_PID=$!
 
 for _ in $(seq 1 30); do
@@ -83,7 +85,7 @@ env S3A_LISTEN="127.0.0.1:$PROXY_PORT" \
   S3A_BACKEND_ACCESS_KEY=minioadmin S3A_BACKEND_SECRET_KEY=minioadmin \
   S3A_KEY_ACTIVE=TLSCHECK S3A_KEY_TLSCHECK="$TEST_KEY_B64" \
   S3A_TLS_CERT="$WORKDIR/cert.pem" S3A_TLS_KEY="$WORKDIR/key.pem" \
-  "$ROOT/target/debug/s3armor" health-probe
+  "$S3ARMOR" health-probe
 
 echo "== aws s3 cp round-trip over https (self-signed cert, --no-verify-ssl) =="
 echo "hello over tls" > "$WORKDIR/plain.txt"

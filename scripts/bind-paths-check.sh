@@ -19,6 +19,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 MINIO_CONTAINER="s3a-bind-paths-check-minio"
 MINIO_PORT=19204
 PROXY_PORT=18284
@@ -72,7 +74,7 @@ start_proxy() {
   S3A_CLIENT_CHECK_ACCESS_KEY=checkkey \
   S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
   S3A_BIND_PATHS="$bind_paths" \
-    "$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3a-$bind_paths.log" 2>&1 &
+    "$S3ARMOR" serve >"$WORKDIR/s3a-$bind_paths.log" 2>&1 &
   S3A_PID=$!
   for _ in $(seq 1 30); do
     curl -sf "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break
@@ -151,12 +153,12 @@ REBIND_ENV=(
   S3A_KEY_BINDPATHSCHECK="$TEST_KEY_B64"
   S3A_BIND_PATHS=on
 )
-DRY_OUT="$(env "${REBIND_ENV[@]}" "$ROOT/target/debug/s3armor" rebind --bucket "$BUCKET" --prefix "off-a" --dry-run)"
+DRY_OUT="$(env "${REBIND_ENV[@]}" "$S3ARMOR" rebind --bucket "$BUCKET" --prefix "off-a" --dry-run)"
 echo "$DRY_OUT"
 echo "$DRY_OUT" | grep -q "would rebind 1" || {
   echo "bind-paths-check: expected rebind --dry-run to report exactly 1 object under prefix off-a"; exit 1;
 }
-env "${REBIND_ENV[@]}" "$ROOT/target/debug/s3armor" rebind --bucket "$BUCKET" --prefix "off-a"
+env "${REBIND_ENV[@]}" "$S3ARMOR" rebind --bucket "$BUCKET" --prefix "off-a"
 
 start_proxy strict
 "${PROXY_AWS[@]}" s3 cp "s3://$BUCKET/off-a.txt" "$WORKDIR/off-a-under-strict.txt"

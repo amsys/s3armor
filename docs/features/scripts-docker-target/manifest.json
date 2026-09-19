@@ -1,0 +1,77 @@
+{
+  "goal": "Each scripts/*-check.sh script runs on a machine where Docker is behind sudo and where cargo builds outside ./target, with `DOCKER=\"sudo docker\" scripts/<name>.sh`, and behaves as before when DOCKER is not set and cargo builds into ./target.",
+  "unknowns": [
+    {
+      "id": "u1",
+      "text": "No agent can start Docker, so no agent can run a script end to end. The user runs scripts/multipart-check.sh and scripts/tooling-check.sh with DOCKER=\"sudo docker\" after the last step.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "id": "u2",
+      "text": "A script that runs longer than the sudo credential timeout asks for the credential again at cleanup. The cleanup call hides stderr, but sudo prompts on the terminal, so the prompt stays visible.",
+      "resolve": "assume-and-flag"
+    }
+  ],
+  "success_criteria": [
+    "`bash -n` passes for each file in scripts/.",
+    "`shellcheck --severity=style --external-sources scripts/*.sh` passes. These are the arguments of the pre-commit hook.",
+    "No script holds the text `ROOT/target/`.",
+    "Each of the eleven scripts/*-check.sh files sources scripts/common.sh after its `ROOT=` line.",
+    "With `DOCKER='echo via-sudo'`, the `docker` function of scripts/common.sh prints `via-sudo run x` for `docker run x`.",
+    "On this machine `$S3ARMOR` from scripts/common.sh is `/tmp/cargo-target/debug/s3armor`.",
+    "No `docker` call site in a script changes."
+  ],
+  "scope_fence": [
+    "No commit and no push. The tree stays uncommitted.",
+    "The working tree already holds uncommitted work in crates/, docs/ARCHITECTURE.md, docs/USER-GUIDE.md and docs/features/mpu-gc/. Do not touch those paths.",
+    "No change to a `docker` call site, a MinIO image name, a container name, a port, or a test assertion in a script.",
+    "No change to .pre-commit-config.yaml, .github/, Cargo.toml or any cargo config.",
+    "No new tool dependency: no jq, no python in the scripts.",
+    "All comments and documentation use ASD-STE100 Simplified Technical English. No banned vocabulary from the user rules. No statement that an agent wrote the text."
+  ],
+  "registration_files": [],
+  "budget": {
+    "escalations_max": 2
+  },
+  "steps": [
+    {
+      "id": "s1",
+      "action": "Make the eleven scripts/*-check.sh scripts work where Docker is behind sudo and where cargo builds outside ./target. (1) Create scripts/common.sh, a bash file that a script sources. It starts with `#!/usr/bin/env bash` and a `# shellcheck shell=bash` line is not necessary when the shebang is present. It expects the caller to set `ROOT` first; give it a clear error when `ROOT` is not set (use `: \"${ROOT:?scripts/common.sh: set ROOT before you source this file}\"`). It does three things. (a) Docker command: `read -r -a DOCKER_CMD <<<\"${DOCKER:-docker}\"`; then check the first word with `command -v \"${DOCKER_CMD[0]}\" >/dev/null` and, when it is missing, print `missing required tool: <word>` to stderr and exit 1; then define `docker() { command \"${DOCKER_CMD[@]}\" \"$@\"; }`. The word `command` is necessary: without it the function calls itself without end when DOCKER is not set. A comment says: some machines put Docker behind sudo; run a script with DOCKER=\"sudo docker\". (b) Target directory: `TARGET_DIR=\"$(cargo metadata --no-deps --format-version 1 --manifest-path \"$ROOT/Cargo.toml\" | sed -n 's/.*\"target_directory\":\"\\([^\"]*\\)\".*/\\1/p')\"`; when `TARGET_DIR` is empty, print `cannot find the cargo target directory` to stderr and exit 1. A comment says: cargo can build outside ./target, through CARGO_TARGET_DIR or build.target-dir in a cargo config. (c) `S3ARMOR=\"$TARGET_DIR/debug/s3armor\"`. If shellcheck reports SC2034 for a variable that only the caller uses, add `export` to that variable or one `# shellcheck disable=SC2034` line with a reason; do not add other disable lines. (2) In each of the eleven scripts, add these two lines directly after the existing `ROOT=` line and before any use of docker or of the binary: `# shellcheck source=scripts/common.sh` and `. \"$ROOT/scripts/common.sh\"`. (3) In each script, replace each `\"$ROOT/target/debug/s3armor\"` with `\"$S3ARMOR\"`. There are 23 such uses. One more place names `target/debug/s3armor` in a comment or message: change that text so it stays true (the binary comes from the cargo target directory). (4) Do not change any `docker` call site: the function takes them over. Do not change the `for tool in docker cargo ...` loops. Keep each script executable. Run the done check and read its output.",
+      "files": [
+        "scripts/common.sh",
+        "scripts/bind-paths-check.sh",
+        "scripts/conditional-check.sh",
+        "scripts/crypto-check.sh",
+        "scripts/e2e-check.sh",
+        "scripts/e2e-rgw-check.sh",
+        "scripts/lifecycle-check.sh",
+        "scripts/multi-backend-check.sh",
+        "scripts/multipart-check.sh",
+        "scripts/passthrough-check.sh",
+        "scripts/tls-check.sh",
+        "scripts/tooling-check.sh"
+      ],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "module",
+      "tier": "mid",
+      "tier_reason": "Twelve files, and no agent can run a script end to end because Docker needs sudo. A wrong position of the source line shows only at run time under `set -u`, so the step needs a model that reads each script before it edits.",
+      "reason": "Developer scripts only. CI does not run them. git revert removes the change.",
+      "done_check": "cd /home/martin/projects/security/s3armor && for f in scripts/*.sh; do bash -n \"$f\" || exit 1; done && shellcheck --severity=style --external-sources scripts/*.sh && ! grep -l 'ROOT/target/' scripts/*.sh && test \"$(grep -l 'scripts/common.sh\"' scripts/*-check.sh | wc -l)\" -eq 11 && for f in scripts/*-check.sh; do awk '/^ROOT=/{r=NR} /scripts\\/common.sh\"/{c=NR} END{exit !(r>0 && c>r)}' \"$f\" || { echo \"source line is not after ROOT= in $f\"; exit 1; }; done && test \"$(DOCKER='echo via-sudo' bash -c 'ROOT=\"$PWD\"; . scripts/common.sh; docker run x')\" = 'via-sudo run x' && test \"$(bash -c 'ROOT=\"$PWD\"; . scripts/common.sh; echo \"$S3ARMOR\"')\" = '/tmp/cargo-target/debug/s3armor' && test \"$(git diff -U0 -- scripts | grep -E '^[-+]' | grep -v -E '^(---|\\+\\+\\+)' | grep -c -E '(^|[^a-zA-Z_])docker (run|rm|exec|logs|stop|ps|inspect|pull|kill|network|compose)')\" -eq 0 && echo S1-DONE-CHECK-PASS"
+    },
+    {
+      "id": "s2",
+      "action": "Update docs/DEVELOPER-GUIDE.md. Find the part that lists the scripts/*-check.sh scripts (a table near line 149). Directly after that table, add one short paragraph with these facts: each script sources scripts/common.sh; on a machine where Docker is behind sudo, run a script as `DOCKER=\"sudo docker\" scripts/<name>.sh`, so that cargo runs as the user and only docker runs through sudo; do not run a script itself under sudo, because cargo would then write root-owned files; the scripts find the s3armor binary through `cargo metadata`, so a target directory set by CARGO_TARGET_DIR or by build.target-dir in a cargo config works. Read scripts/common.sh first so the text agrees with the code. Match the style and line width of the file. Do not change any other section.",
+      "files": [
+        "docs/DEVELOPER-GUIDE.md"
+      ],
+      "depends_on": [
+        "s1"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "local",
+      "reason": "One markdown file with facts fixed by s1.",
+      "done_check": "cd /home/martin/projects/security/s3armor && grep -q 'scripts/common.sh' docs/DEVELOPER-GUIDE.md && grep -q 'DOCKER=\"sudo docker\"' docs/DEVELOPER-GUIDE.md && grep -q 'cargo metadata' docs/DEVELOPER-GUIDE.md && echo S2-DONE-CHECK-PASS"
+    }
+  ]
+}

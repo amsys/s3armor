@@ -7,6 +7,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 MINIO_CONTAINER="s3a-tooling-check-minio"
 MINIO_PORT=19104
 PROXY_PORT=18184
@@ -69,7 +71,7 @@ echo "== s3armor check --bucket $BUCKET (direct to backend) =="
 # failure) should fail this check. `$()` under `set -e` already requires
 # `check` to have exited 0 (compatible/degraded), so this is belt and
 # suspenders against the wording itself.
-CHECK_OUT="$(env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" check --bucket "$BUCKET")"
+CHECK_OUT="$(env "${BACKEND_ENV[@]}" "$S3ARMOR" check --bucket "$BUCKET")"
 echo "$CHECK_OUT"
 echo "$CHECK_OUT" | grep -q "verdict: incompatible" && {
   echo "tooling-check: s3armor check reported 'incompatible' against real MinIO"; exit 1;
@@ -77,18 +79,18 @@ echo "$CHECK_OUT" | grep -q "verdict: incompatible" && {
 true
 
 echo "== s3armor bench (local tier) =="
-env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" bench | tee "$WORKDIR/bench-local.txt"
+env "${BACKEND_ENV[@]}" "$S3ARMOR" bench | tee "$WORKDIR/bench-local.txt"
 grep -q "recommended: S3A_ALG=" "$WORKDIR/bench-local.txt"
 
 echo "== s3armor bench --backend-tier --bucket $BUCKET =="
-env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" bench --backend-tier --bucket "$BUCKET" | tee "$WORKDIR/bench-backend.txt"
+env "${BACKEND_ENV[@]}" "$S3ARMOR" bench --backend-tier --bucket "$BUCKET" | tee "$WORKDIR/bench-backend.txt"
 grep -q "max sustained concurrency" "$WORKDIR/bench-backend.txt"
 
 echo "== starting s3armor serve on :$PROXY_PORT for the --proxy tier =="
 env "${BACKEND_ENV[@]}" S3A_LISTEN="127.0.0.1:$PROXY_PORT" \
   S3A_CLIENT_CHECK_ACCESS_KEY=checkkey \
   S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
-  "$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3armor.log" 2>&1 &
+  "$S3ARMOR" serve >"$WORKDIR/s3armor.log" 2>&1 &
 S3A_PID=$!
 for _ in $(seq 1 30); do
   curl -sf "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break
@@ -105,7 +107,7 @@ echo "== s3armor bench --proxy http://127.0.0.1:$PROXY_PORT --bucket $BUCKET =="
 env "${BACKEND_ENV[@]}" \
   S3A_CLIENT_CHECK_ACCESS_KEY=checkkey \
   S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
-  "$ROOT/target/debug/s3armor" bench --proxy "http://127.0.0.1:$PROXY_PORT" --bucket "$BUCKET" \
+  "$S3ARMOR" bench --proxy "http://127.0.0.1:$PROXY_PORT" --bucket "$BUCKET" \
   | tee "$WORKDIR/bench-proxy.txt"
 grep -q "verified" "$WORKDIR/bench-proxy.txt"
 grep -q " NO" "$WORKDIR/bench-proxy.txt" && {
@@ -116,10 +118,10 @@ kill "$S3A_PID" 2>/dev/null || true
 S3A_PID=""
 
 echo "== --write-config output is valid env s3armor accepts =="
-WRITE_CONFIG_OUT="$(env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" bench --write-config)"
+WRITE_CONFIG_OUT="$(env "${BACKEND_ENV[@]}" "$S3ARMOR" bench --write-config)"
 echo "$WRITE_CONFIG_OUT"
 eval "export ${WRITE_CONFIG_OUT//$'\n'/$'\n'export }"
 env "${BACKEND_ENV[@]}" S3A_ALG="$S3A_ALG" S3A_CHUNK_SIZE="$S3A_CHUNK_SIZE" \
-  "$ROOT/target/debug/s3armor" config >/dev/null
+  "$S3ARMOR" config >/dev/null
 
 echo "== tooling-check: PASS =="

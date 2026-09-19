@@ -24,6 +24,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 RGW_CONTAINER="s3a-e2e-rgw-check-rgw"
 RGW_PORT=19106
 PROXY_PORT=18185
@@ -101,7 +103,7 @@ echo "== s3armor check --bucket $BUCKET against real Ceph RGW =="
 # small-final-part multipart probe — all of docs/ARCHITECTURE.md "Hetzner (Ceph RGW) specifics"'s
 # "Hetzner specifics", "all probed by s3armor check, not assumed", against the
 # backend Hetzner actually runs, not just MinIO.
-CHECK_OUT="$(env "${BACKEND_ENV[@]}" "$ROOT/target/debug/s3armor" check --bucket "$BUCKET")"
+CHECK_OUT="$(env "${BACKEND_ENV[@]}" "$S3ARMOR" check --bucket "$BUCKET")"
 echo "$CHECK_OUT"
 echo "$CHECK_OUT" | grep -q "verdict: incompatible" && {
   echo "e2e-rgw-check: s3armor check reported 'incompatible' against real Ceph RGW"; exit 1;
@@ -112,7 +114,7 @@ echo "== starting s3armor serve on :$PROXY_PORT =="
 env "${BACKEND_ENV[@]}" S3A_LISTEN="127.0.0.1:$PROXY_PORT" \
   S3A_CLIENT_CHECK_ACCESS_KEY=checkkey \
   S3A_CLIENT_CHECK_SECRET_KEY=checksecret1234567890 \
-  "$ROOT/target/debug/s3armor" serve >"$WORKDIR/s3armor.log" 2>&1 &
+  "$S3ARMOR" serve >"$WORKDIR/s3armor.log" 2>&1 &
 S3A_PID=$!
 for _ in $(seq 1 30); do
   curl -sf "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break

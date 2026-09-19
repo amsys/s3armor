@@ -6,7 +6,7 @@
 # ciphertext, not just that the client-visible behavior looks right.
 #
 # Departure from every other scripts/*-check.sh: those use raw `docker
-# run` and the locally built target/debug/s3armor. This one drives `docker
+# run` and the s3armor binary from the cargo target directory. This one drives `docker
 # compose`, because the thing under test is a multi-service product
 # topology — Nextcloud and s3armor wired together the way an operator wires
 # them — and that wiring *is* docker-compose.e2e.yml, itself a deliverable
@@ -24,6 +24,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/common.sh
+. "$ROOT/scripts/common.sh"
 COMPOSE=(docker compose -f "$ROOT/docker-compose.e2e.yml" -p s3a-e2e-check)
 NC_PORT=18380
 NC_ADMIN_PASS="e2e-admin-password"
