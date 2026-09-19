@@ -1,0 +1,147 @@
+{
+  "goal": "s3armor ships as a hardened, tested distroless image, as a .deb (systemd) and an .apk (OpenRC) package for amd64 and arm64, and as plain static binaries; one Containerfile is the only build path, a script tests each artifact, CI runs those scripts on every PR, and a tag push attaches the binaries and packages to the GitHub release.",
+  "unknowns": [
+    {
+      "id": "u1",
+      "text": "No agent can start Docker (it needs sudo with a password). Agents check the scripts statically. The user runs `DOCKER=\"sudo docker\" scripts/container-check.sh` and `DOCKER=\"sudo docker\" scripts/package-check.sh` after the last step; CI runs them with its own Docker.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "id": "u2",
+      "text": "Packages are GitHub release assets only. No apt or apk repository, no package signing. The .apk installs with `apk add --allow-untrusted`. Signing needs a key held as a repo secret; add it when a repository exists.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "id": "u3",
+      "text": "Binaries come from the Containerfile through a `binary` export stage (`docker buildx build --target binary --output type=local,dest=dist/`), built on native amd64 and arm64 runners. This is the rule in docs/ARCHITECTURE.md \"Deployment\": the Docker build exports the binary, no separate build path. The published multi-arch image still builds arm64 under QEMU in release.yml; that is slow but correct, and stays out of scope.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "id": "u4",
+      "text": "nfpm builds both packages from one packaging/nfpm.yaml. It runs from its container image (goreleaser/nfpm, pinned by version), so no host install.",
+      "resolve": "assume-and-flag"
+    }
+  ],
+  "success_criteria": [
+    "`docker build .` with no --target still produces the release image (the `release` stage stays last in Containerfile).",
+    "`docker buildx build --target binary --output type=local,dest=dist/ .` writes one static `s3armor` file into dist/.",
+    "`DOCKER=\"sudo docker\" scripts/container-check.sh` exits 0: the image runs as uid 65532 with a read-only root file system, all capabilities dropped and no-new-privileges; the HEALTHCHECK reaches `healthy`; a PUT then GET through the proxy returns the same bytes and the object at the MinIO backend is not the plaintext; a one-off `check` subcommand runs in the same image; SIGTERM stops the container with exit code 0 inside 10 s.",
+    "`DOCKER=\"sudo docker\" scripts/package-check.sh` exits 0: the .deb installs on debian:12 and debian:13 and the .apk installs on alpine:3 (with --allow-untrusted); in each, `s3armor --version` prints the Cargo version and the service file and the example env file are at their documented paths.",
+    "`bash -n` and `shellcheck --severity=style --external-sources scripts/*.sh` pass.",
+    "Both workflow files load as YAML. ci.yml runs container-check.sh and package-check.sh on pull requests; release.yml on a `v*` tag builds amd64 and arm64 binaries and packages on native runners and uploads them to the GitHub release.",
+    "docs/USER-GUIDE.md \"1. Install\" documents the image with the hardened run flags, the .deb, the .apk and the plain binary; docs/ARCHITECTURE.md \"Deployment\" no longer says there is no release automation."
+  ],
+  "scope_fence": [
+    "No commit and no push. The tree stays uncommitted.",
+    "The working tree holds uncommitted MPU work in crates/, docs/features/mpu-gc/ and docs/ARCHITECTURE.md. Do not touch crates/ or docs/features/mpu-gc/. In docs/ARCHITECTURE.md edit only the \"## Deployment\" section.",
+    "No change to Rust source, Cargo.toml, Cargo.lock or any cargo config.",
+    "No change to the existing scripts/*-check.sh files or scripts/common.sh, except that new scripts source scripts/common.sh.",
+    "No change to the image publish job's tags or registry in release.yml.",
+    "No new host tool dependency for the scripts beyond docker, cargo and the tools the existing scripts already require (aws-cli v2). No jq.",
+    "All comments and documentation use ASD-STE100 Simplified Technical English. No banned vocabulary from the user rules. No statement that an agent wrote the text."
+  ],
+  "registration_files": [
+    "docs/DEVELOPER-GUIDE.md"
+  ],
+  "budget": {
+    "escalations_max": 2
+  },
+  "steps": [
+    {
+      "id": "s1",
+      "action": "Harden Containerfile and add a binary export stage. Read Containerfile and docs/ARCHITECTURE.md \"Deployment\" first. (1) Add `FROM scratch AS binary` with `COPY --from=builder /build/target/release/s3armor /s3armor`, placed before the `release` stage; `release` must stay the last stage (the top comment explains why). Update the top comment to name the new stage and its command: `docker buildx build --target binary --output type=local,dest=dist/ .`. (2) In the builder, use BuildKit cache mounts for the cargo registry and the target dir only if the binary is then copied out of the cache mount inside the same RUN (a cache-mounted target dir is empty in the next stage); otherwise leave the build line as is. (3) On `release` and `debug`: add OCI labels (org.opencontainers.image.source = https://github.com/amsys/s3armor, licenses = AGPL-3.0-or-later, title, description) with `ARG VERSION` feeding org.opencontainers.image.version; add `EXPOSE 8080 9090`; add explicit `USER 65532:65532` (distroless nonroot uid, so Kubernetes runAsNonRoot can verify it); give HEALTHCHECK explicit `--interval=30s --timeout=5s --start-period=10s --retries=3`. (4) Check whether gcr.io/distroless/static-debian13 exists (it does since 2025; confirm with a web lookup if you can). If it does, move both distroless bases to debian13 and keep the same `nonroot` / `debug-nonroot` tags. (5) Keep exec-form ENTRYPOINT/CMD. Do not add a shell, a package manager or any file other than the binary to `release`.",
+      "files": [
+        "Containerfile"
+      ],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "The image is the main way users run s3armor. A wrong stage order makes `docker build .` ship the wrong image. git revert undoes it.",
+      "done_check": "cd /home/martin/projects/security/s3armor && grep -q '^FROM scratch AS binary' Containerfile && test \"$(grep -E '^FROM ' Containerfile | tail -n1 | awk '{print $NF}')\" = release && grep -q 'org.opencontainers.image.source' Containerfile && grep -q '^EXPOSE 8080 9090' Containerfile && test \"$(grep -c '^USER 65532:65532' Containerfile)\" -eq 2 && test \"$(grep -c 'HEALTHCHECK --interval=' Containerfile)\" -eq 2 && echo S1-PASS"
+    },
+    {
+      "id": "s2",
+      "action": "Create the package definition under packaging/. Read docs/USER-GUIDE.md \"1.2 Proxmox LXC / bare systemd\" and the env var names in crates/s3armor/src/config.rs (read only) first. (1) packaging/nfpm.yaml: name s3armor, arch from env `${ARCH}` (amd64|arm64), version from env `${VERSION}`, maintainer, homepage https://github.com/amsys/s3armor, license AGPL-3.0-or-later, description. Contents: dist binary `${BINARY}` -> /usr/bin/s3armor mode 0755; packaging/s3armor.service -> /usr/lib/systemd/system/s3armor.service (packager deb only); packaging/s3armor.initd -> /etc/init.d/s3armor mode 0755 (packager apk only); packaging/s3armor.confd -> /etc/conf.d/s3armor (apk only, type config|noreplace); packaging/env.example -> /etc/s3armor/env type config|noreplace mode 0600. apk scripts: preinstall creates system user/group `s3armor` with `addgroup -S` / `adduser -S -D -H -G s3armor` when missing. No deb maintainer scripts (the unit uses DynamicUser). (2) packaging/s3armor.service: the unit from USER-GUIDE 1.2 plus [Unit] Description/After=network-online.target/Wants=network-online.target, [Install] WantedBy=multi-user.target, ExecStart=/usr/bin/s3armor serve, and systemd sandboxing: NoNewPrivileges, ProtectSystem=strict, ProtectHome, PrivateTmp, PrivateDevices, ProtectKernelTunables, ProtectKernelModules, ProtectControlGroups, RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX, RestrictNamespaces, LockPersonality, MemoryDenyWriteExecute, SystemCallFilter=@system-service, CapabilityBoundingSet= (empty). Keep LoadCredential for the master key at /etc/s3armor/master.key. (3) packaging/s3armor.initd: `#!/sbin/openrc-run`, command=/usr/bin/s3armor, command_args=serve, command_user=s3armor:s3armor, command_background=yes, pidfile under /run, supervisor=supervise-daemon, loads /etc/s3armor/env (export each line) in start_pre, `depend() { need net; }`. Point S3A_KEY_K1_FILE at /etc/s3armor/master.key in the env example comment. (4) packaging/env.example: commented template of the minimum S3A_* variables (backend endpoint, credentials by _FILE where supported, active key), each line commented out, and a line that says give this file mode 0600. Use only variable names that exist in config.rs.",
+      "files": [
+        "packaging/nfpm.yaml",
+        "packaging/s3armor.service",
+        "packaging/s3armor.initd",
+        "packaging/s3armor.confd",
+        "packaging/env.example"
+      ],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "module",
+      "tier": "mid",
+      "tier_reason": "The unit and the OpenRC script are the security boundary of the package install (sandbox flags, key file access). A wrong flag either breaks start-up or drops a protection, and no agent can boot systemd or OpenRC to see it.",
+      "reason": "New files only. git revert removes them.",
+      "done_check": "cd /home/martin/projects/security/s3armor && python3 -c \"import yaml;d=yaml.safe_load(open('packaging/nfpm.yaml'));c=[x['dst'] for x in d['contents']];assert d['name']=='s3armor';[c.index(p) for p in ['/usr/bin/s3armor','/usr/lib/systemd/system/s3armor.service','/etc/init.d/s3armor','/etc/s3armor/env']];print('yaml ok')\" && grep -q '^ExecStart=/usr/bin/s3armor serve' packaging/s3armor.service && grep -q '^ProtectSystem=strict' packaging/s3armor.service && grep -q '^WantedBy=multi-user.target' packaging/s3armor.service && head -n1 packaging/s3armor.initd | grep -q '^#!/sbin/openrc-run' && shellcheck -s sh -e SC2034,SC2154 packaging/s3armor.initd && for v in $(grep -oE 'S3A_[A-Z0-9_]+' packaging/env.example | sort -u | grep -v -E 'S3A_KEY_K1|S3A_KEY_K1_FILE'); do grep -q \"\\\"$v\" crates/s3armor/src/config.rs || { echo \"unknown var $v\"; exit 1; }; done && echo S2-PASS"
+    },
+    {
+      "id": "s3",
+      "action": "Create scripts/container-check.sh, the acceptance test for the distroless image. Read scripts/common.sh, scripts/tls-check.sh and scripts/passthrough-check.sh first and follow their structure exactly (shebang, `set -euo pipefail`, ROOT=, source common.sh, required-tool loop, trap cleanup, MinIO image name, aws-cli use, PASS/FAIL output). It does not need the cargo binary: it builds the image with `docker build -t s3armor:check \"$ROOT\"` (the Containerfile default target). Steps: start MinIO and the image on one user-defined docker network with unique names; run the proxy with `--read-only --cap-drop ALL --security-opt no-new-privileges` and no --user flag (the image sets the user), secrets as files mounted read-only and passed by the S3A_*_FILE variables the other scripts use. Assert, each with a clear FAIL message: (a) `docker inspect -f '{{.Config.User}}'` is 65532:65532; (b) the health status reaches `healthy` within 60 s (poll `{{.State.Health.Status}}`); (c) aws-cli PUT of a random 1 MiB file through the proxy, GET it back, cmp equal; (d) the object read directly from MinIO differs from the plaintext and does not contain its first 64 bytes; (e) `docker run --rm` of the same image with the `check --bucket <bucket>` subcommand exits 0 against the same backend; (f) `docker stop -t 10` returns within 10 s and `{{.State.ExitCode}}` is 0; (g) the image has no shell: `docker run --rm --entrypoint /bin/sh s3armor:check -c true` fails; (h) print the image size. Make the file executable (`chmod +x`).",
+      "files": [
+        "scripts/container-check.sh"
+      ],
+      "depends_on": [
+        "s1"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "module",
+      "tier": "mid",
+      "tier_reason": "The user named the container the most common way to run s3armor; this script is its only end-to-end test, and no agent can run it, so it must be right by reading.",
+      "reason": "New developer script. git revert removes it.",
+      "done_check": "cd /home/martin/projects/security/s3armor && test -x scripts/container-check.sh && bash -n scripts/container-check.sh && shellcheck --severity=style --external-sources scripts/container-check.sh && grep -q 'scripts/common.sh' scripts/container-check.sh && grep -q -- '--read-only' scripts/container-check.sh && grep -q -- '--cap-drop' scripts/container-check.sh && grep -q 'Health.Status' scripts/container-check.sh && grep -q 'ExitCode' scripts/container-check.sh && echo S3-PASS"
+    },
+    {
+      "id": "s4",
+      "action": "Create scripts/package-check.sh, the acceptance test for the packages. Read scripts/common.sh and scripts/tooling-check.sh first and follow their structure. It (1) exports the static binary with `docker buildx build --target binary --output type=local,dest=\"$ROOT/dist\" \"$ROOT\"` for the host arch (ARCH from `uname -m`: x86_64->amd64, aarch64->arm64); (2) reads VERSION from `cargo metadata --no-deps --format-version 1` (sed, no jq) for the s3armor package; (3) builds the .deb and the .apk with the pinned nfpm container image (`docker run --rm -v \"$ROOT:/src\" -w /src -e VERSION -e ARCH -e BINARY goreleaser/nfpm:<pinned version> package -f packaging/nfpm.yaml -p deb -t dist/` and the same with `-p apk`); (4) installs the .deb in debian:12 and debian:13 containers (`dpkg -i`) and the .apk in alpine:3 (`apk add --allow-untrusted`), each with the dist dir mounted read-only, and in each asserts `s3armor --version` output contains VERSION and that the service file (/usr/lib/systemd/system/s3armor.service on Debian, /etc/init.d/s3armor on Alpine) and /etc/s3armor/env exist, and on Alpine that user s3armor exists; (5) accepts `KEEP_DIST=1` to leave dist/ in place, otherwise leaves the packages there anyway since release.yml uploads them (say which in a comment; do not delete them). Add `dist/` to .gitignore if it is not there. Make the file executable.",
+      "files": [
+        "scripts/package-check.sh",
+        ".gitignore"
+      ],
+      "depends_on": [
+        "s1",
+        "s2"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "module",
+      "reason": "New developer script. git revert removes it.",
+      "done_check": "cd /home/martin/projects/security/s3armor && test -x scripts/package-check.sh && bash -n scripts/package-check.sh && shellcheck --severity=style --external-sources scripts/package-check.sh && grep -q 'scripts/common.sh' scripts/package-check.sh && grep -q 'target binary' scripts/package-check.sh && grep -q 'debian:13' scripts/package-check.sh && grep -q 'allow-untrusted' scripts/package-check.sh && grep -qx 'dist/' .gitignore && ! grep -q 'jq' scripts/package-check.sh && echo S4-PASS"
+    },
+    {
+      "id": "s5",
+      "action": "Wire the scripts and the artifacts into GitHub Actions. Read .github/workflows/ci.yml and .github/workflows/release.yml first. (1) ci.yml: replace the `docker` job's two run lines with `scripts/container-check.sh` (install aws-cli v2 first only if ubuntu-latest lacks it; it ships preinstalled on GitHub ubuntu runners), and add a `packages` job with a matrix over `ubuntu-latest` (amd64) and `ubuntu-24.04-arm` (arm64) that runs `scripts/package-check.sh` and uploads dist/*.deb, dist/*.apk and the binary as a workflow artifact named per arch. It needs a Rust toolchain only for `cargo metadata` (dtolnay/rust-toolchain@stable). (2) release.yml: add a `binaries` job with the same native-runner matrix, `permissions: contents: write`, which runs scripts/package-check.sh (builds, packages and install-tests), renames the binary to `s3armor-<version>-linux-<arch>`, writes a SHA256SUMS-<arch> file, and uploads all of them to the GitHub release of the tag with `gh release upload \"$GITHUB_REF_NAME\" ... --clobber`, creating the release first with `gh release create \"$GITHUB_REF_NAME\" --verify-tag --generate-notes` when it does not exist (guard against both matrix legs racing: create in a separate first job `release`, and make `binaries` depend on it). Keep the existing `publish` image job unchanged except that it passes `build-args: VERSION=${{ steps.version.outputs.version }}` so the OCI version label is set. Update release.yml's top comment to name the new artifacts. Pin every action to a major version as the files already do.",
+      "files": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml"
+      ],
+      "depends_on": [
+        "s3",
+        "s4"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "CI and release automation. A tag push runs release.yml and publishes; a wrong job publishes wrong or partial assets. Editing the file publishes nothing; git revert undoes it.",
+      "done_check": "cd /home/martin/projects/security/s3armor && python3 -c \"import yaml;c=yaml.safe_load(open('.github/workflows/ci.yml'));r=yaml.safe_load(open('.github/workflows/release.yml'));import json;s=json.dumps(c);t=json.dumps(r);assert 'container-check.sh' in s and 'package-check.sh' in s and 'ubuntu-24.04-arm' in s;assert 'package-check.sh' in t and 'gh release upload' in t and 'ubuntu-24.04-arm' in t and 'VERSION=' in t;assert 'publish' in r['jobs'];print('yaml ok')\" && echo S5-PASS"
+    },
+    {
+      "id": "s6",
+      "action": "Update the docs. (1) docs/USER-GUIDE.md \"1. Install\": 1.1 Docker gains a hardened production `docker run` example (`--read-only --cap-drop ALL --security-opt no-new-privileges`, secrets mounted as files with S3A_*_FILE, ports 8080 and optional 9090) and a Kubernetes securityContext snippet (runAsNonRoot, runAsUser 65532, readOnlyRootFilesystem, allowPrivilegeEscalation false, capabilities drop ALL); add a new subsection for the Debian package (download from the GitHub release, `apt install ./s3armor_<v>_<arch>.deb`, edit /etc/s3armor/env, put the key at /etc/s3armor/master.key, `systemctl enable --now s3armor`), one for the Alpine package (`apk add --allow-untrusted`, `rc-update add s3armor`, `rc-service s3armor start`, note the package is unsigned), and turn the existing bare-systemd subsection into the plain-binary route (download `s3armor-<v>-linux-<arch>`, check SHA256SUMS, use packaging/s3armor.service as the unit). Renumber the subsections and fix every in-file link to them. (2) docs/ARCHITECTURE.md: edit only the \"## Deployment\" section. Say that the Containerfile `binary` stage is the one build path for binaries and packages, that nfpm builds a .deb (systemd, DynamicUser) and an .apk (OpenRC, system user) from packaging/, that release.yml publishes the image and attaches binaries and packages to the release on a tag, and remove the sentence that says there is no release automation. Fix the acceptance-script count to the new number of scripts/*-check.sh files. (3) docs/DEVELOPER-GUIDE.md: add rows for scripts/container-check.sh and scripts/package-check.sh to the scripts table, and update the CI section's docker job description. (4) README.md install section: add the .deb/.apk/binary routes in one short block next to `docker pull`.",
+      "files": [
+        "docs/USER-GUIDE.md",
+        "docs/ARCHITECTURE.md",
+        "docs/DEVELOPER-GUIDE.md",
+        "README.md"
+      ],
+      "depends_on": [
+        "s5"
+      ],
+      "reversibility": "trivial",
+      "blast_radius": "module",
+      "reason": "Documentation only. One edit undoes each change.",
+      "done_check": "cd /home/martin/projects/security/s3armor && grep -q 'container-check.sh' docs/DEVELOPER-GUIDE.md && grep -q 'package-check.sh' docs/DEVELOPER-GUIDE.md && grep -q 'allow-untrusted' docs/USER-GUIDE.md && grep -q 'readOnlyRootFilesystem' docs/USER-GUIDE.md && grep -q '\\.deb' README.md && ! grep -q 'no release automation' docs/ARCHITECTURE.md && ! grep -q 'eleven in all' docs/ARCHITECTURE.md && echo S6-PASS"
+    }
+  ],
+  "fail_log": []
+}

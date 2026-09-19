@@ -1,0 +1,14 @@
+# OpenRC settings for the s3armor service (/etc/init.d/s3armor).
+#
+# This file is for OpenRC options only. Application settings, including
+# secrets, stay in /etc/s3armor/env — OpenRC loads that file on its own,
+# in the init script's start_pre.
+#
+# Examples, both off by default:
+#
+# Keep more open files than the OpenRC default.
+#rc_ulimit="-n 4096"
+#
+# Send command output to a file instead of the system log.
+#output_log="/var/log/s3armor.log"
+#error_log="/var/log/s3armor.log"

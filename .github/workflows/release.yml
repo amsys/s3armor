@@ -1,9 +1,10 @@
 name: Release
 
 # Publishes the image the docs point operators at (README.md "Install",
-# docs/USER-GUIDE.md "1.1 Docker"). CI's own `docker` job only builds and
-# discards, as a per-PR build check — this is the one workflow that
-# actually pushes.
+# docs/USER-GUIDE.md "1.1 Docker"), and attaches the .deb, the .apk, the
+# static binary and a SHA256SUMS file per architecture to the GitHub
+# release of the tag. CI's own `docker`/`packages` jobs only build and
+# discard, as a per-PR check — this is the one workflow that publishes.
 
 on:
   push:
@@ -13,6 +14,61 @@ env:
   IMAGE: ghcr.io/amsys/s3armor
 
 jobs:
+  # Creates the GitHub release for the tag, if it does not already exist,
+  # before either matrix leg of `binaries` uploads to it. A separate first
+  # job avoids both legs racing to create the same release.
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+
+  # Builds and install-tests the .deb, the .apk and the static binary on a
+  # native runner per architecture (the same script the `packages` job in
+  # ci.yml runs), then attaches them to the release.
+  binaries:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/package-check.sh
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Rename the binary and write the checksum file
+        run: |
+          ARCH="${{ matrix.arch }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          mv dist/s3armor "dist/s3armor-${VERSION}-linux-${ARCH}"
+          cd dist
+          sha256sum "s3armor-${VERSION}-linux-${ARCH}" ./*.deb ./*.apk \
+            >"SHA256SUMS-${ARCH}"
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/s3armor-*-linux-${{ matrix.arch }} \
+            dist/*.deb dist/*.apk \
+            "dist/SHA256SUMS-${{ matrix.arch }}" \
+            --clobber
+
   publish:
     runs-on: ubuntu-latest
     permissions:
@@ -44,6 +100,8 @@ jobs:
           file: Containerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
             ${{ env.IMAGE }}:latest

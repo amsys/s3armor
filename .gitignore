@@ -21,5 +21,9 @@ crates/s3armor/fuzz/target/
 # Coverage report generated for the SonarCloud scan; not committed.
 /lcov.info
 
+# Build artifacts from docker buildx and nfpm packaging; regenerable.
+# scripts/package-check.sh builds these, release.yml uploads them.
+dist/
+
 # Agent memory sync artifacts (auto-generated).
 /memory/

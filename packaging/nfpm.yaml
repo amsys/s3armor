@@ -1,0 +1,70 @@
+# nfpm package definition for s3armor.
+# Builds the .deb and the .apk from one file. See docs/ARCHITECTURE.md
+# "Deployment" and docs/USER-GUIDE.md "1. Install".
+#
+# Build with the pinned nfpm container image, one run per format:
+#   docker run --rm -v "$PWD:/src" -w /src \
+#     -e VERSION -e ARCH -e BINARY \
+#     goreleaser/nfpm:<pinned version> package -f packaging/nfpm.yaml -p deb -t dist/
+# ARCH is "amd64" or "arm64". VERSION is the Cargo package version.
+# BINARY is the path to the static binary that scripts/package-check.sh
+# exports with `docker buildx build --target binary`.
+name: s3armor
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: "s3armor maintainers <s3armor@users.noreply.github.com>"
+description: |
+  A client-side S3 encryption proxy. It sits between S3-compatible
+  storage and the applications that use it. It makes the ciphertext the
+  only thing the storage operator can see.
+vendor: amsys
+homepage: https://github.com/amsys/s3armor
+license: AGPL-3.0-or-later
+
+contents:
+  - src: ${BINARY}
+    dst: /usr/bin/s3armor
+    file_info:
+      mode: 0755
+
+  # systemd unit. Debian package only. DynamicUser=yes creates the
+  # service account at run time, so the .deb needs no maintainer script.
+  - src: packaging/s3armor.service
+    dst: /usr/lib/systemd/system/s3armor.service
+    packager: deb
+    file_info:
+      mode: 0644
+
+  # OpenRC init script. Alpine package only.
+  - src: packaging/s3armor.initd
+    dst: /etc/init.d/s3armor
+    packager: apk
+    file_info:
+      mode: 0755
+
+  # OpenRC settings for the service (not application config).
+  # Alpine package only. config|noreplace keeps a site edit across an
+  # upgrade.
+  - src: packaging/s3armor.confd
+    dst: /etc/conf.d/s3armor
+    packager: apk
+    type: config|noreplace
+
+  # Application settings template, both packages. config|noreplace keeps
+  # a site edit across an upgrade; mode 0600 keeps the file closed to
+  # other users, since a site copy can hold secret file paths.
+  - src: packaging/env.example
+    dst: /etc/s3armor/env
+    type: config|noreplace
+    file_info:
+      mode: 0600
+
+# Alpine has no DynamicUser. The preinstall script makes a fixed system
+# user and group, so the OpenRC service never runs as root.
+overrides:
+  apk:
+    scripts:
+      preinstall: packaging/s3armor-preinstall.sh

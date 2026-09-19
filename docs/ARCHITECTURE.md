@@ -757,39 +757,52 @@ Profiling is built in, not bolted on:
 
 ## Deployment
 
-**Docker.** A multi-stage build: a `rust:alpine` (musl) builder stage,
-producing a static binary, onto a distroless base image (nonroot user; a
-`debug-nonroot` variant for the `-debug` target). The image carries a CA
-bundle, a `HEALTHCHECK` running the binary's own `health-probe`
-subcommand, and an entrypoint that runs the binary directly with `serve`
-as the default command — so `docker run <image> rewrap` and `… check`
-work as one-off invocations of the same image, not separate binaries.
-There is one binary. `check`, `bench`, and `rewrap` are subcommands of
-it, never shipped as sibling binaries into a production image.
+**Docker build path.** The `Containerfile` has one builder stage (musl) and
+a multi-target output: a `binary` stage exports the static binary; a
+`release` stage (the last stage, built by default) runs the binary on a
+distroless base image (nonroot user; a `debug-nonroot` variant for the
+`-debug` target). The image carries a CA bundle, a `HEALTHCHECK` running
+the binary's own `health-probe` subcommand, and an entrypoint that runs the
+binary directly with `serve` as the default command — so `docker run
+<image> rewrap` and `… check` work as one-off invocations of the same
+image, not separate binaries. There is one binary. `check`, `bench`, and
+`rewrap` are subcommands of it, never shipped as sibling binaries.
 
-**Proxmox LXC.** The same static musl binary runs with no container
-runtime at all: one binary, one environment file sourced by systemd, and a
-short systemd unit (`DynamicUser=yes`, `LoadCredential=` for secret
-material). This fits comfortably inside a 256 MiB LXC. The Docker build
-exports the binary as a build artifact; there is no separate build path
-for the LXC case.
+**Packages and plain binaries.** The `binary` stage is the sole build path
+for all distribution formats. The static binary from `docker buildx build
+--target binary` is packaged into `.deb` (systemd, `DynamicUser=yes`) and
+`.apk` (OpenRC, system user) using `nfpm`, configured in `packaging/` and
+driven by shell scripts. No separate Rust build path exists for packages —
+only the Docker build.
 
-**CI.** `fmt`, `clippy -D warnings`, `nextest`, the coverage gate
-("Coverage"), `cargo-deny`, the fuzz smoke jobs ("Fuzz-target policy"),
-integration tests against a MinIO testcontainer, and a `docker build` step
-that runs `--version`
-against the produced image. CI builds and verifies an image; it does not
-publish one. There is no tag-triggered registry push and no release
-automation job.
+**Proxmox LXC.** The same static binary runs with no container runtime:
+one binary, one environment file sourced by systemd, and a short systemd
+unit (`DynamicUser=yes`, `LoadCredential=` for secret material). This
+fits inside a 256 MiB LXC. The Docker build exports the binary; there is
+no separate build path for this case either.
+
+**CI and release.** Pull requests run `fmt`, `clippy -D warnings`,
+`nextest`, the coverage gate ("Coverage"), `cargo-deny`, the fuzz smoke
+jobs ("Fuzz-target policy"), and integration tests against a MinIO
+testcontainer. `ci.yml`'s `docker` job runs `scripts/container-check.sh`
+against the built release image, and its `packages` job runs
+`scripts/package-check.sh` on native amd64 and arm64 runners — both on
+every pull request, so a hardening or packaging break is caught before
+a release, not after one. Neither job publishes anything. A `v*` tag
+triggers `release.yml` instead: it runs `package-check.sh` again per
+architecture and attaches the binaries and packages to the GitHub
+release, while a separate job publishes the multi-arch image to the
+registry. `release.yml` does not run `container-check.sh`.
 
 Acceptance scripts under `scripts/` (`passthrough-check.sh` through
-`lifecycle-check.sh`, eleven in all)
-are shell-level checks run against a real built binary and a real backend
-(MinIO or, for `e2e-rgw-check.sh`, a local Ceph RGW container). They exist because some
-properties — a graceful shutdown sequence, a health endpoint's behavior
-under load, an image's actual `HEALTHCHECK` wiring — are only observable
-against the real process and the real container, not against a Rust test
-harness standing in for it.
+`package-check.sh`, thirteen in all)
+are shell-level checks run against the real built binary and a real backend
+(MinIO or, for `e2e-rgw-check.sh`, a local Ceph RGW container). They
+exist because some properties — a graceful shutdown sequence, a health
+endpoint's behavior under load, an image's actual `HEALTHCHECK` wiring,
+and package install correctness — are only observable against the real
+process and the real container, not against a Rust test harness standing
+in for it.
 
 ---
 

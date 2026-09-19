@@ -32,33 +32,104 @@ A `-debug` build tag adds a profiling endpoint (see
 [Metrics](#6-metrics), below). Do not run the `-debug` image in
 production.
 
-### 1.2 Proxmox LXC / bare systemd
+#### 1.1a Hardened production deployment
 
-The same static binary runs with no container runtime. Build it with
-`cargo build --release` (produces `target/release/s3armor`), put it on the
-LXC, add one env file, and add a small systemd unit:
+For production use, run the image with full sandboxing. Store secrets in
+files, never in environment variables:
 
-```ini
-# /etc/systemd/system/s3armor.service
-[Service]
-DynamicUser=yes
-EnvironmentFile=/etc/s3armor/env
-LoadCredential=master_key:/etc/s3armor/master.key
-Environment=S3A_KEY_ACTIVE=K1
-Environment=S3A_KEY_K1_FILE=%d/master_key
-ExecStart=/usr/local/bin/s3armor serve
-Restart=on-failure
+```sh
+docker run --rm \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -v /path/to/master.key:/run/secrets/master.key:ro \
+  -v /path/to/backend.key:/run/secrets/backend.key:ro \
+  -e S3A_BACKEND_ENDPOINT=https://fsn1.your-objectstorage.com \
+  -e S3A_BACKEND_ACCESS_KEY=... \
+  -e S3A_BACKEND_SECRET_KEY_FILE=/run/secrets/backend.key \
+  -e S3A_CLIENT_APP_ACCESS_KEY=app \
+  -e S3A_CLIENT_APP_SECRET_KEY_FILE=/run/secrets/app.key \
+  -e S3A_KEY_ACTIVE=K1 \
+  -e S3A_KEY_K1_FILE=/run/secrets/master.key \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  ghcr.io/amsys/s3armor:0.1
 ```
 
-`LoadCredential` alone only stages the key file under
-`$CREDENTIALS_DIRECTORY` (`%d`) — the two `Environment=` lines are what
-point `s3armor` at it; a unit with `LoadCredential` but no matching
-`S3A_KEY_<NAME>_FILE` fails at startup with no key material configured.
+For Kubernetes, use this `securityContext`:
 
-Give the env file mode `0600`. It holds secrets, same as a Docker secret
-mount, just in one file instead of one file per secret.
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+```
 
-### 1.3 Shell completions
+### 1.2 Debian package
+
+Download the `.deb` file for your architecture from the GitHub release:
+
+```sh
+wget https://github.com/amsys/s3armor/releases/download/v<version>/s3armor_<version>_amd64.deb
+sudo apt install ./s3armor_<version>_amd64.deb
+```
+
+Edit `/etc/s3armor/env` with your configuration, then put the master key at
+`/etc/s3armor/master.key`:
+
+```sh
+sudo tee /etc/s3armor/master.key > /dev/null <<< "$(openssl rand -base64 32)"
+sudo chmod 0600 /etc/s3armor/master.key
+sudo systemctl enable --now s3armor
+```
+
+The package installs a systemd unit with `DynamicUser=yes`, so the service
+runs as an unprivileged user with no login shell. The service keeps the env
+file and the master key private.
+
+### 1.3 Alpine package
+
+Alpine packages are unsigned. Install with the `--allow-untrusted` flag:
+
+```sh
+wget https://github.com/amsys/s3armor/releases/download/v<version>/s3armor_<version>_aarch64.apk
+sudo apk add --allow-untrusted ./s3armor_<version>_aarch64.apk
+```
+
+The package creates a system user named `s3armor` with no login shell.
+Configure your environment at `/etc/s3armor/env` and put the master key at
+`/etc/s3armor/master.key`. The service runs as the `s3armor` user, so give
+that group read access to the key:
+
+```sh
+sudo chown root:s3armor /etc/s3armor/master.key
+sudo chmod 0640 /etc/s3armor/master.key
+sudo rc-update add s3armor
+sudo rc-service s3armor start
+```
+
+The package is unsigned because there is no key. When a signing key exists,
+this step will move to a package repository.
+
+### 1.4 Plain binary
+
+Download the static binary and SHA256SUMS from the GitHub release:
+
+```sh
+wget https://github.com/amsys/s3armor/releases/download/v<version>/s3armor-<version>-linux-amd64
+wget https://github.com/amsys/s3armor/releases/download/v<version>/SHA256SUMS-amd64
+sha256sum -c SHA256SUMS-amd64
+sudo install -m 0755 s3armor-<version>-linux-amd64 /usr/local/bin/s3armor
+```
+
+Create an env file and a systemd unit. The unit from
+[`packaging/s3armor.service`](../packaging/s3armor.service) is a hardened
+baseline; adjust it for your system.
+
+### 1.5 Shell completions
 
 ```sh
 s3armor completions bash > /etc/bash_completion.d/s3armor

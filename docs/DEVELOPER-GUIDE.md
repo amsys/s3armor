@@ -147,6 +147,8 @@ stands in for it.
 | `scripts/e2e-rgw-check.sh` | Ceph RGW: `s3armor check --bucket` clean, plus a proxy round-trip, a multipart upload, and a ranged GET, against a real Ceph RGW container — the same software Hetzner Object Storage runs. |
 | `scripts/conditional-check.sh` | Conditional requests (`If-Match`/`If-None-Match`): a plaintext-checksum PUT, `aws-cli`'s own conditional get-object flags, and a raw `curl` conditional header, each checked against the exact HTTP status returned. |
 | `scripts/lifecycle-check.sh` | Graceful drain, `/ready`, `S3A_TIMEOUT_CONNECT`, and `S3A_BIND_PATHS=strict` plus `rebind` — against the real compiled binary: SIGTERM sent mid-upload flips `/health` to 503 immediately while the in-flight PUT still completes, then the process exits on its own once drained. |
+| `scripts/container-check.sh` | Hardened image verification: uid 65532 with read-only root, all capabilities dropped, no-new-privileges, HEALTHCHECK, PUT/GET round-trip with ciphertext verification at MinIO, one-off `check` subcommand invocation, and SIGTERM shutdown within 10 seconds. |
+| `scripts/package-check.sh` | Package build and install test: static binary export, `.deb` and `.apk` build with nfpm, installation on debian:12, debian:13, and alpine:3, version string verification, and correct service/config file placement. |
 
 Each script sources `scripts/common.sh` after setting `ROOT`. On a machine
 where Docker requires sudo, run `DOCKER="sudo docker" scripts/<name>.sh` —
@@ -156,12 +158,14 @@ directory. Scripts find the s3armor binary through `cargo metadata`, so
 any target directory set by `CARGO_TARGET_DIR` or by `build.target-dir` in
 a cargo config works.
 
-None of these scripts run in CI (see [section 10](#10-continuous-integration)).
-Run them locally before a change that touches proxying, crypto, multipart,
-tooling, TLS, bind-path binding, the compose stack, conditional requests, or
-shutdown behavior. Each script lists its own required tools at the top of
-the file (`docker`, `cargo`, `aws-cli` v2, and a small set of others per
-script) and fails fast if one is missing.
+`container-check.sh` and `package-check.sh` run in CI on every pull
+request (see [section 10](#10-continuous-integration)); the other
+scripts in this table do not. Run all of them locally before a change
+that touches proxying, crypto, multipart, tooling, TLS, bind-path
+binding, the compose stack, conditional requests, packaging, or
+shutdown behavior. Each script lists its own required tools at the top
+of the file (`docker`, `cargo`, `aws-cli` v2, and a small set of others
+per script) and fails fast if one is missing.
 
 ## 5. Fuzzing
 
@@ -400,8 +404,15 @@ never carries it and is already treated as unauthenticated on purpose.)
   each.
 - **deny** — `cargo-deny`, checking the license/advisory/ban policy from
   section 8.
-- **docker** — builds the release image and runs `--version` against it as
-  a smoke test.
+- **docker** — runs `scripts/container-check.sh` against the release
+  image: hardened run flags, the `HEALTHCHECK`, a PUT/GET round trip
+  through a real MinIO backend, and the one-off `check` subcommand.
+- **packages** — runs `scripts/package-check.sh` on a native amd64
+  runner and a native arm64 runner: builds the static binary, the
+  `.deb`, and the `.apk`, then install-tests each one, and uploads them
+  as build artifacts. This is the same script a `v*` tag push runs
+  through `release.yml`, so a packaging break is caught on the pull
+  request that introduces it, not on the release that ships it.
 - **pre-commit** — runs the hygiene, secret-scan, and shellcheck hooks
   (`gitleaks`, `shellcheck`, `detect-private-key`) for anyone who did not
   install the hooks locally. `fmt` and `clippy` are skipped here since the
@@ -411,11 +422,16 @@ never carries it and is already treated as unauthenticated on purpose.)
 - **sonarcloud** — uploads that coverage report to SonarCloud for further
   static analysis, gated on the coverage job passing first.
 
-The `scripts/*-check.sh` real-backend scripts from section 4, and the
-`docker-compose.e2e.yml` stack from section 7, do **not** run in CI. They
-need Docker containers, native client tools, and in one case a very large
-Ceph image — deliberately kept out of the default CI run. Run them locally
-before a change that touches the behavior they check.
+A `v*` tag push runs `.github/workflows/release.yml` instead of
+`ci.yml`. It runs `package-check.sh` again per architecture, attaches
+the binaries and packages to the GitHub release, and publishes the
+multi-arch image to the registry; it does not run `container-check.sh`.
+
+The other `scripts/*-check.sh` real-backend scripts from section 4, and
+the `docker-compose.e2e.yml` stack from section 7, do **not** run in
+CI. They need Docker containers, native client tools, and in one case a
+very large Ceph image — deliberately kept out of the default CI run.
+Run them locally before a change that touches the behavior they check.
 
 ## 11. Contribution conventions
 

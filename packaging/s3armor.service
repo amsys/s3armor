@@ -1,0 +1,37 @@
+# systemd unit for s3armor.
+# The .deb package installs this file at
+# /usr/lib/systemd/system/s3armor.service. For a manual bare-systemd
+# install, see docs/USER-GUIDE.md "1. Install".
+[Unit]
+Description=s3armor client-side S3 encryption proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+EnvironmentFile=/etc/s3armor/env
+LoadCredential=master_key:/etc/s3armor/master.key
+Environment=S3A_KEY_ACTIVE=K1
+Environment=S3A_KEY_K1_FILE=%d/master_key
+ExecStart=/usr/bin/s3armor serve
+Restart=on-failure
+
+# Sandbox. The process gets no new privilege, no capability, and a
+# read-only view of the system outside its own state.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

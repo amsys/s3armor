@@ -46,8 +46,11 @@ operator holds ciphertext and nothing else.
 ## Install
 
 ```sh
-# Container image
+# Container image (hardened at runtime — see docs/USER-GUIDE.md)
 docker pull ghcr.io/amsys/s3armor:0.1
+
+# ...or .deb (Debian 12+), .apk (Alpine 3+), or static binary
+# Download from https://github.com/amsys/s3armor/releases
 
 # ...or build from source
 cargo build --release

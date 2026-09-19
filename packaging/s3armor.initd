@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+# OpenRC service script for s3armor.
+# The .apk package installs this file at /etc/init.d/s3armor. See
+# docs/USER-GUIDE.md "1. Install" for the Alpine route.
+
+name="s3armor"
+description="s3armor client-side S3 encryption proxy"
+command=/usr/bin/s3armor
+command_args="serve"
+command_user="s3armor:s3armor"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+supervisor="supervise-daemon"
+
+depend() {
+	need net
+}
+
+start_pre() {
+	# Load the application settings file and export every line, the
+	# same way systemd's EnvironmentFile= does on the Debian package.
+	if [ -r /etc/s3armor/env ]; then
+		set -a
+		# shellcheck disable=SC1091
+		. /etc/s3armor/env
+		set +a
+	fi
+}

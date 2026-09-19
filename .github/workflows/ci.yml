@@ -77,8 +77,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -f Containerfile -t s3armor:ci .
-      - run: docker run --rm s3armor:ci --version
+      # GitHub's ubuntu-latest runner ships aws-cli v2 and curl already —
+      # scripts/container-check.sh needs no setup step for them.
+      - run: scripts/container-check.sh
+
+  # Builds the .deb, the .apk and the static binary on a native runner per
+  # architecture, and install-tests each package. This is the same script
+  # release.yml runs on a tag push, so a PR catches a packaging break
+  # before it reaches a release.
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # Only cargo metadata reads the crate version — no build, no cache.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/package-check.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.apk
+            dist/s3armor
 
   pre-commit:
     runs-on: ubuntu-latest
