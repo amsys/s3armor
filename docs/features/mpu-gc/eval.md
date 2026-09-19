@@ -33,3 +33,17 @@ Escalations: 0 of 2. No rework after "done".
   upload on the backend.
 - `scripts/tooling-check.sh`: PASS. The new probe shows a check mark on
   MinIO, so the test image sends `Server: MinIO`. Unknown u1 is closed.
+
+## Rework after done
+
+`Sessions::make_room` returned `true` when it selected a victim, even when
+its own `remove` removed nothing. Two concurrent creates at the cap
+selected the same session, and both inserted. A load of 4 threads x 600
+creates ended at 1787 to 1975 sessions against a cap of 1024, in 20 of 20
+runs. The judge of s1 and the first review did not find it. A stress
+experiment outside the repo found it, while the edge-case test list was
+written. Fix: `remove_if` in a retry loop. A single attempt also held the
+cap, but it rejected 840 to 937 of 2400 creates. The loop rejected 345
+to 352, and only when no finished session existed.
+Lesson: a check-then-act sequence on a shared map needs a concurrent test
+before "done", not after.

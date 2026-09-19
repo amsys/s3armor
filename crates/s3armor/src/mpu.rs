@@ -204,24 +204,38 @@ impl Sessions {
     /// every session is still open — the caller then answers `SlowDown`
     /// rather than growing memory without bound.
     ///
-    /// ponytail: an O(`MAX_SESSIONS`) scan, run only at the cap. An
-    /// ordered index by `last_activity` is the upgrade path if the cap
-    /// ever grows past about 10000.
+    /// At the cap, `true` means that this call removed a finished session
+    /// itself. Two callers can select the same oldest session. `remove_if`
+    /// lets only one of them remove it, and the other selects again. A
+    /// plain `remove` let both callers return `true` for one free slot, and
+    /// the map grew far past the cap under concurrent creates.
+    ///
+    /// ponytail: an O(`MAX_SESSIONS`) scan, run only at the cap, and one
+    /// more for each lost race. An ordered index by `last_activity` is the
+    /// upgrade path if the cap ever grows past about 10000.
     #[must_use]
     pub fn make_room(&self) -> bool {
         if self.0.len() < MAX_SESSIONS {
             return true;
         }
-        let victim: Option<SessionKey> = self
-            .0
-            .iter()
-            .filter(|entry| entry.value().completed.is_some())
-            .min_by_key(|entry| entry.value().last_activity)
-            .map(|entry| entry.key().clone());
-        victim.is_some_and(|key| {
-            self.0.remove(&key);
-            true
-        })
+        loop {
+            let victim: Option<SessionKey> = self
+                .0
+                .iter()
+                .filter(|entry| entry.value().completed.is_some())
+                .min_by_key(|entry| entry.value().last_activity)
+                .map(|entry| entry.key().clone());
+            let Some(key) = victim else {
+                return false;
+            };
+            if self
+                .0
+                .remove_if(&key, |_, session| session.completed.is_some())
+                .is_some()
+            {
+                return true;
+            }
+        }
     }
 
     pub fn get(
@@ -432,9 +446,7 @@ mod tests {
 
     #[test]
     fn make_room_at_the_cap_evicts_the_oldest_finished_session() {
-        let sessions = at_the_cap_with_finished(&["older", "newer"]);
-        let older = named_key("older");
-        let newer = named_key("newer");
+        let (sessions, older, newer) = at_the_cap_with_two_finished("older", "newer");
         assert_eq!(sessions.len(), MAX_SESSIONS);
 
         // The helper finishes both sessions. `finish` touches
@@ -573,11 +585,19 @@ mod tests {
         sessions
     }
 
+    /// Fills a node to `MAX_SESSIONS` with two finished sessions, and
+    /// returns the keys of the two finished sessions.
+    fn at_the_cap_with_two_finished(a: &str, b: &str) -> (Sessions, SessionKey, SessionKey) {
+        (
+            at_the_cap_with_finished(&[a, b]),
+            named_key(a),
+            named_key(b),
+        )
+    }
+
     #[test]
     fn make_room_a_second_time_evicts_nothing_more() {
-        let sessions = at_the_cap_with_finished(&["older", "newer"]);
-        let older = named_key("older");
-        let newer = named_key("newer");
+        let (sessions, older, newer) = at_the_cap_with_two_finished("older", "newer");
         sessions.get_mut(&older).unwrap().last_activity = two_hours_ago();
 
         assert!(sessions.make_room());
@@ -593,9 +613,7 @@ mod tests {
 
     #[test]
     fn make_room_with_equal_activity_evicts_exactly_one() {
-        let sessions = at_the_cap_with_finished(&["first", "second"]);
-        let first = named_key("first");
-        let second = named_key("second");
+        let (sessions, first, second) = at_the_cap_with_two_finished("first", "second");
         let same = two_hours_ago();
         sessions.get_mut(&first).unwrap().last_activity = same;
         sessions.get_mut(&second).unwrap().last_activity = same;
@@ -641,12 +659,14 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_create_and_finish_never_lose_an_open_session() {
+    fn concurrent_creates_keep_open_sessions_and_the_soft_bound() {
         use std::sync::{mpsc, Arc};
+
+        const THREADS: usize = 4;
 
         let sessions = Arc::new(Sessions::new());
         let (tx, rx) = mpsc::channel();
-        for t in 0..4 {
+        for t in 0..THREADS {
             let sessions = Arc::clone(&sessions);
             let tx = tx.clone();
             std::thread::spawn(move || {
@@ -674,7 +694,7 @@ mod tests {
         drop(tx);
 
         let mut open = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..THREADS {
             match rx.recv_timeout(Duration::from_secs(60)) {
                 Ok(keys) => open.extend(keys),
                 Err(mpsc::RecvTimeoutError::Timeout) => panic!("deadlock suspected in Sessions"),
@@ -686,5 +706,15 @@ mod tests {
         for key in &open {
             assert!(sessions.get(key).is_some(), "open session {key:?} was lost");
         }
+
+        // Guards: the retry loop in `make_room`. At the cap it returns `true`
+        // only after its own `remove_if` removed a finished session, so two
+        // callers never count the same eviction. `len()` is not atomic across
+        // shards, so the bound allows two in-flight creates for each thread.
+        assert!(
+            sessions.len() <= MAX_SESSIONS + 2 * THREADS,
+            "{} sessions, the cap is {MAX_SESSIONS}",
+            sessions.len()
+        );
     }
 }

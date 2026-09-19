@@ -60,6 +60,10 @@ const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// Complete from buffering a client-chosen amount of memory.
 const MAX_COMPLETE_XML_BYTES: usize = 4 * 1024 * 1024;
 
+/// The `SlowDown` message when the node is at `MAX_SESSIONS` and has no
+/// finished session to evict.
+const CAP_MESSAGE: &str = "This node holds too many open multipart uploads; retry later.";
+
 fn bucket_key(raw_path: &str) -> Result<(String, String), S3Error> {
     let route = route::parse(raw_path);
     match (route.bucket, route.key) {
@@ -103,7 +107,7 @@ pub async fn handle_create(
     // `make_room` first evicts the oldest finished session, so a burst of
     // completions does not block new uploads for the rest of the TTL.
     if !state.sessions.make_room() {
-        return Err(S3Error::slow_down());
+        return Err(S3Error::slow_down(CAP_MESSAGE));
     }
     let alg = state.config.alg;
     let chunk_size = state.config.chunk_size;
@@ -158,7 +162,7 @@ pub async fn handle_create(
         // Lost a race against the cap (no finished session was left to
         // evict) after the backend initiated the upload. The backend's own
         // incomplete-upload lifecycle reclaims the orphan.
-        return Err(S3Error::slow_down());
+        return Err(S3Error::slow_down(CAP_MESSAGE));
     }
     state.record_mpu_session_created();
 
@@ -557,7 +561,9 @@ fn claim_completion(
         return Ok(Some(cached_response(cached, request_id)));
     }
     if entry.completing {
-        return Err(S3Error::slow_down());
+        return Err(S3Error::slow_down(
+            "A Complete for this upload is already in progress; retry later.",
+        ));
     }
     entry.completing = true;
     drop(entry);

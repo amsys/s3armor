@@ -891,7 +891,10 @@ the client can retry it.
 session cap it does nothing. At the cap it removes the finished session
 with the oldest last activity, and the new upload starts. When no finished
 session exists, it removes nothing, and the create answers `SlowDown` as
-before. The scan is O(cap) and runs at the cap only.
+before. Two creates can select the same finished session at the same time.
+Only one of them removes it, and the other selects again. One eviction thus
+never counts for two new sessions, and the cap holds under concurrent
+creates. The scan is O(cap) and runs at the cap only.
 
 The TTL sweeper does not change. It still expires a session 24 h after its
 last activity, and it aborts the backend upload of an unfinished one.

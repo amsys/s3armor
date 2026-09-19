@@ -123,16 +123,13 @@ impl S3Error {
         Self::new(StatusCode::GATEWAY_TIMEOUT, "GatewayTimeout", message)
     }
 
-    /// This source IP has failed auth too many times recently
-    /// (`S3A_AUTH_FAIL_LIMIT`, `crate::ratelimit`) — `429` with S3's own
-    /// `SlowDown` code, so ordinary S3 clients apply their existing
-    /// retry/backoff instead of treating it as a hard failure.
-    pub fn slow_down() -> Self {
-        Self::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "SlowDown",
-            "Too many failed authentication attempts from this address; slow down.",
-        )
+    /// `429` with S3's own `SlowDown` code, so ordinary S3 clients apply
+    /// their existing retry/backoff instead of treating it as a hard
+    /// failure. The caller names the cause: the auth-failure limit
+    /// (`S3A_AUTH_FAIL_LIMIT`, `crate::ratelimit`), the session cap, or a
+    /// Complete that is already in progress.
+    pub fn slow_down(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, "SlowDown", message)
     }
 
     /// PUT with no usable length — S3 requires one, and format v1 needs the

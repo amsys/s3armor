@@ -321,7 +321,9 @@ async fn handle_inner(
 ) -> Result<Response<ProxyBody>, S3Error> {
     if !state.auth_rate_limiter.allow(peer_ip) {
         state.auth_rate_limited.fetch_add(1, Ordering::Relaxed);
-        return Err(S3Error::slow_down());
+        return Err(S3Error::slow_down(
+            "Too many failed authentication attempts from this address; slow down.",
+        ));
     }
 
     let method = req.method().as_str().to_string();

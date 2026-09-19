@@ -1062,8 +1062,12 @@ async fn create_at_the_cap_with_only_open_sessions_is_slow_down_and_starts_no_ba
         .await
         .expect_err("Create at the cap with only open sessions must fail");
 
-    // Guards: `handle_create` returns `SlowDown` before it calls the backend.
-    assert!(format!("{err:?}").contains("SlowDown"));
+    // Guards: `handle_create` returns `SlowDown` before it calls the backend,
+    // and the message names the session cap, not failed authentication.
+    let err = format!("{err:?}");
+    assert!(err.contains("SlowDown"));
+    assert!(err.contains("multipart uploads"), "{err}");
+    assert!(!err.contains("authentication"), "{err}");
     let uploads = minio
         .list_multipart_uploads()
         .bucket("mpu-test")
