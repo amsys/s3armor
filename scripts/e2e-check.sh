@@ -144,7 +144,12 @@ echo "== the actual product promise: ciphertext at rest, direct to MinIO =="
 # real `grep -a` exists.
 BACKEND_SECRET="$(cat "$ROOT/secrets-e2e/backend_secret")"
 mkdir -p "$WORKDIR/candidates"
-CIPHERTEXT_CHECK="$(docker run --rm --network "s3a-e2e-check_default" -v "$WORKDIR/candidates:/out" \
+# --pids-limit=-1: this loop forks a child per candidate object. Some
+# rootless-podman hosts default new containers to a pids cgroup far
+# below Docker's unlimited default, which breaks even a handful of
+# forks; -1 asks for no limit and is a no-op where the default already
+# allows it.
+CIPHERTEXT_CHECK="$(docker run --rm --pids-limit=-1 --network "s3a-e2e-check_default" -v "$WORKDIR/candidates:/out" \
   --entrypoint sh quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z -c "
   set -e
   mc alias set m http://minio:9000 minioadmin '$BACKEND_SECRET' >/dev/null

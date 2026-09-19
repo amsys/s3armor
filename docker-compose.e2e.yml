@@ -44,7 +44,11 @@ services:
       retries: 12
 
   createbuckets:
-    image: minio/mc:latest
+    # Same image as the `minio` service above, not a separate `minio/mc`
+    # pull: MinIO Inc. restricted several Docker Hub repos (mc included),
+    # so every MinIO image in this repo comes from quay.io. The `minio`
+    # image bundles the `mc` binary this entrypoint calls.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     depends_on:
       minio:
         condition: service_healthy
