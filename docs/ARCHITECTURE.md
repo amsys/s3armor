@@ -253,9 +253,11 @@ There is no shared keystream, no ordering channel, no parking, and no
 reorder buffer.
 
 Session state held per upload: `{DEK, algorithm, chunk_size, per-part
-plaintext sizes, part ETags}` — a few hundred bytes, held in memory. The
-session TTL is measured from **last activity**, not creation, and is swept
-by a task that actually runs.
+plaintext sizes, part ETags}` — a few hundred bytes, held in memory. A
+finished session keeps only the cached Complete response; its DEK, part map
+and buffered part tails go at Complete ("Garbage collection"). The session
+TTL is measured from **last activity**, not creation, and is swept by a
+task that actually runs.
 
 **Footer part.** At `CompleteMultipartUpload`, the proxy uploads an
 encrypted, authenticated record: `{version, (client part number, plaintext
@@ -289,8 +291,9 @@ trailer.
   bytes, then the footer itself), cached in a small LRU.
 - **Complete is safe to retry.** SDKs retry `CompleteMultipartUpload`. The
   session is not deleted at Complete; it is marked completed with the
-  response cached, and expires only by TTL. A retried Complete returns the
-  cached response.
+  response cached, and it expires by TTL, or earlier if the node is at the
+  session cap and needs its slot ("Garbage collection"). A retried Complete
+  returns the cached response while the session exists.
 - **Part-list validation.** The proxy compares the client's submitted part
   list against its own recorded ETags and returns `InvalidPart` on any
   mismatch.
@@ -351,10 +354,11 @@ keyed by the wrapped DEK bytes themselves — content-addressed, so it cannot
 go stale the way a key-plus-object-name cache would — bounded, TTL'd, and
 zeroizing on eviction. Build that only once a benchmark demands it.
 
-`zeroize` is used at exactly three sites: the `MasterKey` type derives
+`zeroize` is used at exactly four sites: the `MasterKey` type derives
 `ZeroizeOnDrop`; the HKDF-derived KEK copy is zeroized immediately after
-the cipher is built from it; and a multipart session's DEK is zeroized on
-`Drop`. Every other DEK in the system — the one a PUT or multipart-create
+the cipher is built from it; and a multipart session's DEK is zeroized at a
+successful Complete ("Garbage collection") and again on `Drop`. Every other
+DEK in the system — the one a PUT or multipart-create
 mints, the one key resolution returns, the copy each streaming encryptor or
 decryptor holds for the life of one request body — is a bare 32-byte array
 with no zeroizing wrapper. These are short-lived stack values on a hot
@@ -504,7 +508,7 @@ A consistent, single ETag policy across PUT, HEAD, and GET.
 | AEAD | aes-gcm, chacha20poly1305 (RustCrypto) | hardware-accelerated, no C toolchain dependency |
 | RSA | rsa (RustCrypto, OAEP) | write-only cluster support |
 | KDF / hash / MAC | hkdf, sha2, hmac, md5 | key derivation and the plaintext-MD5 ETag path |
-| Key hygiene | zeroize, subtle | `ZeroizeOnDrop` on the master key, the HKDF-derived KEK copy, and the multipart session DEK only — not every DEK in flight ("Zeroization") |
+| Key hygiene | zeroize, subtle | `ZeroizeOnDrop` on the master key, the HKDF-derived KEK copy, and the multipart session DEK (at Complete and on `Drop`) only — not every DEK in flight ("Zeroization") |
 | Config | toml + a small custom env loader | exact flat env names, the `_FILE` convention; the optional `config.toml` lowers to the same flat names ("Configuration model") |
 | CLI | clap (derive) | subcommands |
 | Logging | tracing + tracing-subscriber | spans double as profiling markers |
@@ -662,11 +666,18 @@ s3armor check
   ✓ ranged GET honored (bytes=5-9 → 206)
   ✓ CopyObject preserves user metadata (passthrough-copy soundness)
   ✓ checksum trailer behavior with CRC32-on SDK
+  ✓ bucket lifecycle rule aborts incomplete multipart uploads (read-only)
   → verdict: compatible / degraded (what breaks) / incompatible
 ```
 
 Each probe maps to a specific format or protocol requirement. A failure
 names the consequence, not just the failed step.
+
+The lifecycle probe is the one probe that checks the operator's
+configuration, not the backend's protocol behavior. It reads the bucket
+lifecycle configuration and writes nothing. It gives `Warn`, never `Fail`,
+because a missing rule costs money and does not break correctness
+("Garbage collection").
 
 ### Integration tests
 
@@ -838,6 +849,93 @@ handler read that slot when the stream aborts and map it to the `4xx`.
 
 ---
 
+## Garbage collection
+
+s3armor writes no sidecar objects. All per-object state travels in the
+object's own `x-amz-meta-s3a-*` headers ("Object metadata v1"), so a delete
+or an overwrite removes that state with the object. Nothing is left behind,
+so no collector walks a bucket. The garbage that does exist is multipart
+only.
+
+### The sources of garbage
+
+| Source | Where | Collected by |
+|---|---|---|
+| A finished multipart session: DEK, part map, buffered part tails | RAM of one node | Collector 1, at Complete |
+| A backend multipart upload orphaned by a restart | Backend, billed | Collector 2 |
+| A backend multipart upload orphaned by the cap race in `handle_create` | Backend, billed | Collector 2 |
+| A backend multipart upload whose sweeper abort failed | Backend, billed | Collector 2 |
+
+Two sources stay uncollected on purpose:
+
+- **`s3a-check-*` and `s3a-bench-*` objects after a killed run.** `s3armor
+  check` and `s3armor bench` remove their own probe objects on the normal
+  paths only. A later run uses a new prefix and cannot know the old one.
+  The operator removes these by prefix.
+- **New object versions from `s3armor rewrap` or `s3armor rebind` on a
+  versioned bucket.** These versions are data, not garbage. Bucket
+  versioning is the rollback mitigation ("Ciphertext is not bound to the
+  object path in default mode").
+
+### Collector 1: the finished session in RAM
+
+`Session::finish` runs at a successful `CompleteMultipartUpload`. It
+zeroizes the session DEK, drops the part map and the buffered part tails,
+and keeps the cached Complete response. The finished session then holds
+about 1 KiB and no key material. A failed Complete keeps its full state, so
+the client can retry it.
+
+`Sessions::make_room` runs before a new session is created. Below the
+session cap it does nothing. At the cap it removes the finished session
+with the oldest last activity, and the new upload starts. When no finished
+session exists, it removes nothing, and the create answers `SlowDown` as
+before. The scan is O(cap) and runs at the cap only.
+
+The TTL sweeper does not change. It still expires a session 24 h after its
+last activity, and it aborts the backend upload of an unfinished one.
+
+### Collector 2: the bucket lifecycle rule of the backend
+
+An orphaned backend multipart upload holds storage that the operator pays
+for. The proxy does not collect it, because the backend already has the
+correct tool: a bucket lifecycle rule with
+`AbortIncompleteMultipartUpload`. That rule is an operator requirement, and
+`s3armor check` has a read-only probe that makes its absence visible
+("Backend conformance check"). The probe reads the bucket lifecycle
+configuration and writes nothing. It gives `Ok` or `Warn`, never `Fail`: a
+missing rule costs money, it does not break correctness.
+
+MinIO is the exception. MinIO accepts such a rule but drops the
+`AbortIncompleteMultipartUpload` field, so no probe can find it there.
+MinIO removes a stale upload on its own instead, after the time in
+`api stale_uploads_expiry` (default 24 h). The probe recognizes a MinIO
+backend and reports `Ok`.
+
+### Invariants
+
+- A retried Complete gets the same cached response while its session
+  exists.
+- An unknown `uploadId`, and an `UploadPart` on a finished session, fail
+  closed with `NoSuchUpload`.
+- No session DEK stays in memory after a successful Complete.
+- At the cap, a create still answers `SlowDown` when no finished session
+  can be removed.
+- Garbage collection never deletes an object version. Bucket versioning is
+  the documented mitigation against a rollback, so a collector that removed
+  a version would remove the mitigation.
+- The `s3armor check` lifecycle probe writes nothing.
+
+### Known limit
+
+At the session cap, `make_room` can remove a finished session before its
+client retries Complete. That retry then gets `NoSuchUpload` in place of
+the cached response. The object itself is complete on the backend, so no
+data is lost, but the client sees an error. This needs a burst of
+completions inside one SDK retry window. Removal of the oldest activity
+first keeps the case rare.
+
+---
+
 ## Rejected designs
 
 These were considered and rejected. Do not re-litigate them without new
@@ -874,6 +972,22 @@ information that changes the tradeoff.
   See "A single-part PUT's plaintext ETag is only available with a
   client-supplied Content-MD5" for the full reasoning; both were rejected
   as disproportionate to the gap they would close.
+- **An `s3armor gc` subcommand that walks a bucket or the open uploads.**
+  The backend's own `AbortIncompleteMultipartUpload` lifecycle rule
+  collects the same garbage with no code here ("Garbage collection"). If a
+  later version does build one, it must select an upload by idle time — the
+  newest part `LastModified` from `ListParts` — and not by age. An age
+  filter on `Initiated` aborts a slow upload that is still live.
+- **Backend garbage collection inside `serve`.** The proxy does not know
+  the bucket list, and two instances would abort the uploads of each other.
+- **A second clock for finished multipart sessions.** A retention period
+  shorter than the session TTL frees no key and almost no memory, because
+  `Session::finish` already releases both at Complete ("Garbage
+  collection"). It only adds a second constant to reason about.
+- **A second map for finished multipart sessions.** More moving parts, and
+  it needs a cap of its own.
+- **A timer wheel or a heap for session expiry.** The session map holds at
+  most 1024 entries. A scan of all of them each 60 s costs almost nothing.
 
 ---
 
@@ -902,8 +1016,11 @@ mitigation.
 
 A restart loses in-flight uploads. Clients retry; already-completed
 objects are unaffected, and a retried Complete is safe within the session
-TTL. Snapshotting session state to disk is a possible future option if
-LXC operators need it; nothing today builds it.
+TTL. A successful Complete releases the DEK, the part map and the buffered
+part tails immediately, and at the session cap a finished session can be
+removed before its TTL to give its slot to a new upload ("Garbage
+collection"). Snapshotting session state to disk is a possible future
+option if LXC operators need it; nothing today builds it.
 
 ### Write-only (RSA) nodes cannot serve GETs
 

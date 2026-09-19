@@ -1,0 +1,97 @@
+{
+  "goal": "A finished multipart session releases its DEK, parts and tails at Complete and no longer blocks new uploads at the session cap, `s3armor check` reports if the bucket has a rule that aborts incomplete multipart uploads, and docs/ARCHITECTURE.md records the garbage collection design.",
+  "unknowns": [
+    {
+      "id": "u1",
+      "text": "The MinIO image of the test suites sends the response header `Server: MinIO`. The probe uses this header to report Ok on MinIO. No agent can start Docker, so no agent can observe the header.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "id": "u2",
+      "text": "The suite integration_mpu needs Docker through sudo. An agent can only build it with --no-run. The user runs the built test binary and the scripts multipart-check.sh and tooling-check.sh after the last step.",
+      "resolve": "assume-and-flag"
+    }
+  ],
+  "success_criteria": [
+    "`cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` pass.",
+    "`cargo test -p s3armor --lib` passes and includes the four new tests in mpu.rs and the seven new tests in tools/check.rs.",
+    "`cargo test -p s3armor --test integration_mpu --no-run` builds.",
+    "No existing test is changed, skipped or deleted.",
+    "docs/ARCHITECTURE.md has a `Garbage collection` section and no longer says `exactly three sites`.",
+    "docs/USER-GUIDE.md names the AbortIncompleteMultipartUpload rule as an operator requirement and states the MinIO exception."
+  ],
+  "scope_fence": [
+    "No commit and no push. The tree stays uncommitted.",
+    "No change to `Session::expired`, `Sessions::take_expired`, the sweeper in proxy/mod.rs, or any config knob. No new constant for retention.",
+    "No change in crates/s3armor-format.",
+    "No `s3armor gc` subcommand, no bucket walk, no backend garbage collection inside `serve`.",
+    "No code deletes an object version.",
+    "No existing test is weakened, skipped or deleted. If a test looks wrong, stop and report it.",
+    "The items under `Found, not in scope` in the plan stay untouched: the key-retirement advice, the sessions_active metric, the cleanup paths of check and bench, the plain DEK copies.",
+    "All documentation and comments use ASD-STE100 Simplified Technical English. No banned vocabulary from the user rules. No statement that an agent wrote the text."
+  ],
+  "registration_files": [],
+  "budget": {
+    "escalations_max": 2
+  },
+  "steps": [
+    {
+      "id": "s0",
+      "action": "Write the design record in docs/ARCHITECTURE.md. Read the approved plan first (context path): its sections `Design`, `Invariants`, `Rejected` and `Stage 0` are the content. (1) Add a new `## Garbage collection` section directly before `## Rejected designs`. It must state: s3armor writes no sidecar objects, so a delete or an overwrite leaves no garbage and no bucket walk is necessary; the inventory of garbage sources (finished sessions in RAM, orphaned backend multipart uploads from a restart, from the cap race in handle_create, and from a failed sweeper abort, plus two sources that stay uncollected on purpose: `s3a-check-*` and `s3a-bench-*` objects after a killed run, and new versions from `rewrap` or `rebind` on a versioned bucket); collector 1 (`Session::finish` releases the DEK, parts and tails at Complete, and `Sessions::make_room` removes the finished session with the oldest activity when the node is at the cap); collector 2 (the lifecycle rule of the backend that aborts incomplete multipart uploads, made visible by a read-only `s3armor check` probe, with the MinIO exception: MinIO ignores that rule field and removes stale uploads on its own, `api stale_uploads_expiry`, default 24 h); the invariants from the plan, with the rule that garbage collection never deletes an object version because versioning is the rollback mitigation; the known limit (at the cap, a finished session can be removed before its client retries Complete, and that retry then gets NoSuchUpload). (2) Add the rejected designs from the plan to `## Rejected designs`, each with its reason: the `s3armor gc` subcommand (and the note that a later version must use idle time from the newest part LastModified of ListParts, because an age filter on Initiated can abort a slow upload that is still live), backend garbage collection inside `serve`, a second clock for finished sessions, a second map for finished sessions, a timer wheel or heap for expiry. (3) Correct the sentences that the code change makes false: the Zeroization section near line 354 (`exactly three sites` becomes four sites: the session DEK is zeroized at Complete and on Drop) and the dependency table row near line 507; the session state sentence near lines 256-258 (a finished session keeps only the cached response); the Complete retry text near lines 290-292 and the section `Multipart sessions are RAM, single instance` near lines 903-906 (add the release at Complete and the removal at the cap). (4) Add the new probe to the probe list of the section `Backend conformance check` near lines 649-668: it reads the lifecycle configuration of the bucket, it writes nothing, and it gives Warn, never Fail. Match the style, heading depth and line width of the file. Do not change any other section.",
+      "files": [
+        "docs/ARCHITECTURE.md"
+      ],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "local",
+      "tier": "strong",
+      "tier_reason": "This is the design record of a crypto proxy. Each later session reads it as fact, and AGENTS.md tells agents not to re-open its decisions. A wrong sentence here misleads all later work, so the text is not written by a cheap model.",
+      "reason": "The user asked for the design record first. One markdown file; git revert removes it.",
+      "done_check": "cd /home/martin/projects/security/s3armor && ! grep -q 'exactly three sites' docs/ARCHITECTURE.md && grep -q -E '^## Garbage collection' docs/ARCHITECTURE.md && grep -q 'make_room' docs/ARCHITECTURE.md && grep -q 'stale_uploads_expiry' docs/ARCHITECTURE.md && grep -q 'LastModified' docs/ARCHITECTURE.md && echo S0-DONE-CHECK-PASS"
+    },
+    {
+      "id": "s1",
+      "action": "Fix the lifetime of finished multipart sessions. Read the approved plan first (context path), section `Collector 1`. Work test-first: write the tests, run them, see them fail, then write the code. Tests, in the existing `#[cfg(test)] mod tests` of crates/s3armor/src/mpu.rs: `finish_releases_the_dek_parts_and_tails` (after `finish`, `dek` is None, `parts` and `tails` are empty, `completed` is Some), `record_part_on_a_finished_session_changes_nothing` (after `finish`, `Session::record_part` with a tail leaves `parts` and `tails` empty), `make_room_at_the_cap_evicts_the_oldest_finished_session` (fill to MAX_SESSIONS with two finished sessions of different `last_activity`; `make_room` returns true, the older finished session is gone, the newer one and all open sessions stay), `make_room_at_the_cap_with_no_finished_session_rejects` (fill to MAX_SESSIONS with open sessions; `make_room` returns false and the length does not change). One integration test in crates/s3armor/tests/integration_mpu.rs, `upload_part_after_complete_is_no_such_upload`, built from the existing helpers `setup`, `create_upload`, `upload_one`, `complete`: an UploadPart after a successful Complete gives the S3 error code NoSuchUpload. This test is a contract pin; it passes before and after the change. Code in crates/s3armor/src/mpu.rs: (a) `Session.dek` becomes `Option<[u8; 32]>`; `Session::new` keeps its signature and stores `Some(dek)`; the `Drop` impl still calls `self.dek.zeroize()`. (b) `pub fn finish(&mut self, cached: CachedComplete)`: zeroize the DEK (this leaves None), clear `parts` and `tails`, set `completed`, call `touch()`. (c) `pub fn record_part(&mut self, part_number: u32, pt_len: u64, etag: String, ct: Option<Bytes>)`: return at once when `completed.is_some()`; else do what the body of the free function `record_part` in intercept/mpu.rs does today (insert the PartRecord, apply the tail rule, touch). (d) `pub fn make_room(&self) -> bool` on `Sessions`: true when `len() < MAX_SESSIONS`; at the cap, find the key of the finished session with the oldest `last_activity`, end the iterator, then remove that key and return true; return false when no finished session exists. Never call `remove` while a DashMap iterator or Ref is alive: that deadlocks. Follow the collect-then-remove pattern of `take_expired`. Add a `ponytail:` comment: O(MAX_SESSIONS) scan, only at the cap; an ordered index is the upgrade path if the cap grows past about 10000. (e) `Sessions::create` calls `make_room` in place of the raw length comparison, and still accepts a key that already exists. Code in crates/s3armor/src/intercept/mpu.rs: the pre-check at the top of `handle_create` calls `state.sessions.make_room()` in place of the length comparison; `handle_upload_part` and `snapshot_for_complete` map a `None` DEK to `S3Error::no_such_upload(&upload_id)` with `ok_or_else` (no unwrap, no expect, no indexing); the free function `record_part` becomes a delegate to `Session::record_part`; `complete_upload` calls `entry.finish(CachedComplete { .. })` on success in place of the two assignments, and its failure branch stays as it is. Refresh the doc comments that the change makes false: the module comment and the comments on `CachedComplete` and `MAX_SESSIONS` in mpu.rs, and the comments near the cap race and above `handle_complete` in intercept/mpu.rs. Do not change `expired`, `take_expired`, the sweeper, or any existing test.",
+      "files": [
+        "crates/s3armor/src/mpu.rs",
+        "crates/s3armor/src/intercept/mpu.rs",
+        "crates/s3armor/tests/integration_mpu.rs"
+      ],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "The change moves the point where a data encryption key is zeroized and changes who can read it. That is key handling, so the blast radius is system. git revert undoes it.",
+      "done_check": "cd /home/martin/projects/security/s3armor && grep -q 'fn finish_releases_the_dek_parts_and_tails' crates/s3armor/src/mpu.rs && grep -q 'fn record_part_on_a_finished_session_changes_nothing' crates/s3armor/src/mpu.rs && grep -q 'fn make_room_at_the_cap_evicts_the_oldest_finished_session' crates/s3armor/src/mpu.rs && grep -q 'fn make_room_at_the_cap_with_no_finished_session_rejects' crates/s3armor/src/mpu.rs && grep -q 'fn upload_part_after_complete_is_no_such_upload' crates/s3armor/tests/integration_mpu.rs && cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test -p s3armor --lib && cargo test -p s3armor --test integration_mpu --no-run && echo S1-DONE-CHECK-PASS"
+    },
+    {
+      "id": "s2",
+      "action": "Add a read-only lifecycle probe to crates/s3armor/src/tools/check.rs. Read the approved plan first (context path), section `Collector 2`. Work test-first. (a) A pure function `fn classify_lifecycle(status: u16, server: Option<&str>, body: &[u8]) -> Status`, no network. Rules, in this order: the `server` value contains `MinIO` (ASCII case-insensitive) gives `Status::Ok`; status 200 and the body has a `Rule` whose `Status` text is `Enabled` and which has an `AbortIncompleteMultipartUpload` element gives `Status::Ok`; status 200 with no such rule (this includes a rule that has the element but is `Disabled`) gives `Status::Warn`; status 404 gives `Status::Warn` (no lifecycle configuration); status 403 gives `Status::Warn` and the text names the permission `s3:GetLifecycleConfiguration`; any other status gives `Status::Warn` with the text that the lifecycle configuration cannot be read and the status number. Never `Status::Fail`. The Warn texts for a missing rule say that orphaned multipart parts stay billed until a rule aborts incomplete multipart uploads. Parse rule by rule with `quick_xml` events, as crates/s3armor/src/tools/list.rs does; a substring search is wrong because it accepts a Disabled rule. (b) The first `#[cfg(test)] mod tests` of this file, with these seven tests: `a_minio_server_header_is_ok`, `an_enabled_abort_rule_is_ok`, `a_disabled_abort_rule_warns`, `a_lifecycle_with_no_abort_rule_warns`, `a_missing_lifecycle_configuration_warns`, `a_forbidden_lifecycle_read_warns_and_names_the_permission`, `an_unexpected_status_warns`. `Status` has no PartialEq; use `matches!` in the tests, do not add derives that the code does not need. (c) An async probe `lifecycle_abort_rule_probe(state, backend, bucket) -> Probe` that sends `GET /{bucket}` with the query `lifecycle` through `forward` with an empty body, reads the `server` response header with the existing `header_owned` and `to_pairs`, collects the body, and calls `classify_lifecycle`. A transport error gives `Status::Warn` with the error text. The probe writes nothing to the bucket. (d) Append the probe to the `vec!` in `check()`, after `multipart_small_final_part_probe`. The lint policy denies unwrap, expect and indexing outside tests. Do not change any other probe.",
+      "files": [
+        "crates/s3armor/src/tools/check.rs"
+      ],
+      "depends_on": [
+        "s1"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "local",
+      "tier": "mid",
+      "tier_reason": "The classifier is an XML event parser on a safety check: a wrong Ok hides a missing rule from the operator. It must also pass clippy pedantic, nursery and the restriction lints with no unwrap, expect or indexing.",
+      "reason": "One file, and the probe only reads. It waits for s1 because both steps run clippy on the whole workspace, and a half-written s1 would fail this step's check.",
+      "done_check": "cd /home/martin/projects/security/s3armor && grep -q 'fn classify_lifecycle' crates/s3armor/src/tools/check.rs && grep -q 'fn lifecycle_abort_rule_probe' crates/s3armor/src/tools/check.rs && grep -q 'fn a_minio_server_header_is_ok' crates/s3armor/src/tools/check.rs && grep -q 'fn an_enabled_abort_rule_is_ok' crates/s3armor/src/tools/check.rs && grep -q 'fn a_disabled_abort_rule_warns' crates/s3armor/src/tools/check.rs && grep -q 'fn a_lifecycle_with_no_abort_rule_warns' crates/s3armor/src/tools/check.rs && grep -q 'fn a_missing_lifecycle_configuration_warns' crates/s3armor/src/tools/check.rs && grep -q 'fn a_forbidden_lifecycle_read_warns_and_names_the_permission' crates/s3armor/src/tools/check.rs && grep -q 'fn an_unexpected_status_warns' crates/s3armor/src/tools/check.rs && cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test -p s3armor --lib tools::check && echo S2-DONE-CHECK-PASS"
+    },
+    {
+      "id": "s3",
+      "action": "Update docs/USER-GUIDE.md for operators. Read the approved plan first (context path), section `Collector 2`, and read the new probe in crates/s3armor/src/tools/check.rs so the guide uses the same words as the probe. (1) Add the new probe to the probe list of the `s3armor check` section (near lines 573-580): it reads the lifecycle configuration of the bucket, it writes nothing, a missing rule gives a warning and the verdict `degraded`, and it never makes the verdict `incompatible`. (2) Add a short paragraph in the multipart part of the guide that states the operator requirement: set a bucket lifecycle rule with the action AbortIncompleteMultipartUpload, because a restart of the proxy loses its multipart sessions and the uploads they started stay on the backend and stay billed. Give one example rule as lifecycle XML with `DaysAfterInitiation`, and say that the number of days must be longer than the longest upload the operator expects, because the backend counts from the start of the upload. (3) State the MinIO exception: MinIO ignores this rule field and removes stale uploads on its own (`api stale_uploads_expiry`, default 24 h), so the probe reports Ok on MinIO. (4) If the credentials cannot read the lifecycle configuration, the probe gives a warning; name the permission `s3:GetLifecycleConfiguration`. Do not change the `S3A_MP_TTL` row or any other section. Match the style and line width of the file.",
+      "files": [
+        "docs/USER-GUIDE.md"
+      ],
+      "depends_on": [
+        "s2"
+      ],
+      "reversibility": "cheap",
+      "blast_radius": "local",
+      "reason": "One markdown file with facts fixed by the plan. It waits for s2 so the guide names the probe as the code does.",
+      "done_check": "cd /home/martin/projects/security/s3armor && grep -q 'AbortIncompleteMultipartUpload' docs/USER-GUIDE.md && grep -q 'DaysAfterInitiation' docs/USER-GUIDE.md && grep -q 'stale_uploads_expiry' docs/USER-GUIDE.md && grep -q 's3:GetLifecycleConfiguration' docs/USER-GUIDE.md && echo S3-DONE-CHECK-PASS"
+    }
+  ]
+}

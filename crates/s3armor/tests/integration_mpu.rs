@@ -25,6 +25,8 @@ use aws_sdk_s3::config::{BehaviorVersion, Builder, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
+use bytes::Bytes;
+use http::StatusCode;
 use hyper_util::rt::TokioIo;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -35,6 +37,7 @@ use s3armor::config::{
     Backend, BindMode, ClientCredentials, Config, LogFormat, DEFAULT_BACKEND_NAME,
 };
 use s3armor::keys::Keyring;
+use s3armor::mpu::{CachedComplete, MAX_SESSIONS};
 use s3armor::proxy::{self, ProxyState};
 use s3armor_format::v1::{ciphertext_len, Alg, MasterKey};
 
@@ -573,6 +576,31 @@ async fn abort_frees_the_session() {
     assert!(format!("{err:?}").contains("NoSuchUpload"));
 }
 
+/// Contract pin: an UploadPart after a successful Complete fails with
+/// `NoSuchUpload`, both before and after `Session::finish` releases the
+/// session's DEK — the backend already answers this way today, since a
+/// completed upload id is no longer open on the backend either.
+#[tokio::test]
+async fn upload_part_after_complete_is_no_such_upload() {
+    let (client, _minio, _ep, _c, _state) = setup().await;
+    let key = "after-complete.bin";
+    let upload_id = create_upload(&client, key).await;
+    let e1 = upload_one(&client, key, &upload_id, 1, payload(BIG_PART, 1)).await;
+    complete(&client, key, &upload_id, vec![(1, e1)]).await;
+
+    let err = client
+        .upload_part()
+        .bucket("mpu-test")
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(2)
+        .body(ByteStream::from(payload(10, 2)))
+        .send()
+        .await
+        .expect_err("UploadPart after Complete must fail");
+    assert!(format!("{err:?}").contains("NoSuchUpload"));
+}
+
 /// `UploadPartCopy` is explicitly unsupported in v1 (ciphertext cannot be
 /// re-chunked server-side) — must fail loudly, never silently corrupt.
 #[tokio::test]
@@ -933,4 +961,149 @@ async fn complete_referencing_a_tail_evicted_by_decoy_parts_fails_cleanly() {
         listing.contents().iter().all(|o| o.key() != Some(key)),
         "no object should exist at {key} after a failed Complete"
     );
+}
+
+fn synthetic_key(i: usize) -> s3armor::mpu::SessionKey {
+    (
+        DEFAULT_BACKEND_NAME.to_string(),
+        "mpu-test".to_string(),
+        format!("synthetic-{i}"),
+        format!("synthetic-upload-{i}"),
+    )
+}
+
+/// Adds open synthetic sessions until the node is at `MAX_SESSIONS`.
+fn fill_to_the_cap(state: &ProxyState) {
+    let mut i = 0;
+    while state.sessions.len() < MAX_SESSIONS {
+        assert!(state.sessions.create(
+            synthetic_key(i),
+            [0u8; 32],
+            Alg::Aes256Gcm,
+            TEST_CHUNK_SIZE
+        ));
+        i += 1;
+    }
+}
+
+const fn finished() -> CachedComplete {
+    CachedComplete {
+        status: StatusCode::OK,
+        headers: Vec::new(),
+        body: Bytes::new(),
+    }
+}
+
+/// Abort after a successful Complete removes the finished session. The
+/// completed object stays, and a retried Complete then gets `NoSuchUpload`.
+#[tokio::test]
+async fn abort_after_complete_keeps_the_object_and_drops_the_session() {
+    let (client, _minio, _ep, _c, state) = setup().await;
+    let key = "abort-after-complete.bin";
+    let upload_id = create_upload(&client, key).await;
+    let e1 = upload_one(&client, key, &upload_id, 1, payload(BIG_PART, 1)).await;
+    complete(&client, key, &upload_id, vec![(1, e1.clone())]).await;
+
+    // The backend answer for a finished upload id is not the same on each backend.
+    let _ = client
+        .abort_multipart_upload()
+        .bucket("mpu-test")
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await;
+
+    // Guards: `handle_abort` removes the session after each backend response.
+    assert_eq!(get_bytes(&client, key).await, payload(BIG_PART, 1));
+    assert_eq!(state.mpu_sessions_active(), 0);
+    let completed = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(1).e_tag(e1).build())
+        .build();
+    let err = client
+        .complete_multipart_upload()
+        .bucket("mpu-test")
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect_err("Complete after Abort must fail");
+    assert!(format!("{err:?}").contains("NoSuchUpload"));
+}
+
+/// At the cap, a new upload evicts the one finished session.
+#[tokio::test]
+async fn create_at_the_cap_evicts_a_finished_session() {
+    let (client, _minio, _ep, _c, state) = setup().await;
+    fill_to_the_cap(&state);
+    let victim = synthetic_key(0);
+    state.sessions.get_mut(&victim).unwrap().finish(finished());
+
+    let _upload_id = create_upload(&client, "cap-evict.bin").await;
+
+    // Guards: the `make_room` call before the backend call in `handle_create`.
+    let evicted = state.sessions.get(&victim).is_none();
+    assert!(evicted);
+    assert_eq!(state.sessions.len(), MAX_SESSIONS);
+}
+
+/// At the cap with only open sessions, Create is `SlowDown`, and the proxy
+/// starts no upload on the backend.
+#[tokio::test]
+async fn create_at_the_cap_with_only_open_sessions_is_slow_down_and_starts_no_backend_upload() {
+    let (client, minio, _ep, _c, state) = setup().await;
+    fill_to_the_cap(&state);
+
+    let err = client
+        .create_multipart_upload()
+        .bucket("mpu-test")
+        .key("cap-full.bin")
+        .send()
+        .await
+        .expect_err("Create at the cap with only open sessions must fail");
+
+    // Guards: `handle_create` returns `SlowDown` before it calls the backend.
+    assert!(format!("{err:?}").contains("SlowDown"));
+    let uploads = minio
+        .list_multipart_uploads()
+        .bucket("mpu-test")
+        .send()
+        .await
+        .expect("ListMultipartUploads");
+    assert!(
+        uploads.uploads().is_empty(),
+        "no backend upload may start: {:?}",
+        uploads.uploads()
+    );
+}
+
+/// Known limit (docs/ARCHITECTURE.md "Garbage collection"): when cap
+/// pressure evicts a finished session, a retried Complete for it gets
+/// `NoSuchUpload`. The object itself stays.
+#[tokio::test]
+async fn a_retried_complete_after_eviction_at_the_cap_is_no_such_upload() {
+    let (client, _minio, _ep, _c, state) = setup().await;
+    let key = "first.bin";
+    let upload_id = create_upload(&client, key).await;
+    let e1 = upload_one(&client, key, &upload_id, 1, payload(BIG_PART, 1)).await;
+    complete(&client, key, &upload_id, vec![(1, e1.clone())]).await;
+    fill_to_the_cap(&state);
+
+    let _second = create_upload(&client, "second.bin").await;
+
+    // Guards: `make_room` evicts the finished session and its cached response.
+    let completed = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(1).e_tag(e1).build())
+        .build();
+    let err = client
+        .complete_multipart_upload()
+        .bucket("mpu-test")
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect_err("a retried Complete after eviction must fail");
+    assert!(format!("{err:?}").contains("NoSuchUpload"));
+    assert_eq!(get_bytes(&client, key).await, payload(BIG_PART, 1));
 }

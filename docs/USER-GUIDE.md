@@ -560,6 +560,38 @@ and gets the backend's own, correct response.
 If a client sends an operation not in this table, the proxy passes it
 through verbatim and returns the backend's own response.
 
+### 9.1 Multipart upload lifecycle requirement
+
+s3armor does not walk the bucket to clean up incomplete multipart uploads
+when the proxy restarts or a session expires. A restart loses the in-memory
+multipart session state, and any uploads it started stay on the backend
+until a backend lifecycle rule removes them. Set a bucket lifecycle rule
+with the action `AbortIncompleteMultipartUpload` to clean up these orphaned
+parts and stop the billing clock on them. The number of days must be longer
+than the longest multipart upload the operator expects. The backend counts
+from the start of the upload, not from each part's timestamp.
+
+Example rule in lifecycle XML:
+
+```xml
+<Rule>
+  <ID>abort-incomplete-multipart</ID>
+  <Status>Enabled</Status>
+  <Filter><Prefix></Prefix></Filter>
+  <AbortIncompleteMultipartUpload>
+    <DaysAfterInitiation>7</DaysAfterInitiation>
+  </AbortIncompleteMultipartUpload>
+</Rule>
+```
+
+**MinIO exception:** MinIO ignores the `AbortIncompleteMultipartUpload` field
+with no error and removes stale uploads on its own via `api stale_uploads_expiry`
+(default 24 hours). `s3armor check` reports this configuration as working on
+MinIO.
+
+If the credentials cannot read the bucket's lifecycle configuration, `s3armor
+check` gives a warning and names the missing permission: `s3:GetLifecycleConfiguration`.
+
 ## 10. The preflight check (`s3armor check`)
 
 `s3armor check` is a preflight and health probe for a backend. Run it with
@@ -576,8 +608,9 @@ authenticate, a small put/get/delete round-trip works, your encryption
 metadata survives a PUT-then-HEAD cycle intact, there is enough
 metadata headroom for your key type, multipart uploads with a small
 final part are accepted, ranged GET works, CopyObject preserves user
-metadata, and checksum trailers behave as expected. It prints a verdict:
-compatible, degraded (naming what breaks), or incompatible.
+metadata, checksum trailers behave as expected, and the bucket has a
+lifecycle rule that aborts incomplete multipart uploads. It prints a
+verdict: compatible, degraded (naming what breaks), or incompatible.
 
 **Exit code reflects only `incompatible`.** `compatible` and `degraded`
 both exit `0` — a `degraded` backend still works, just with a named

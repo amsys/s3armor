@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::Bytes;
 use http_body_util::BodyExt;
+use quick_xml::events::Event;
+use quick_xml::Reader;
 
 use crate::config::Backend;
 use crate::intercept::mpu::{build_complete_xml, parse_single_tag};
@@ -97,6 +99,7 @@ pub async fn check(state: &ProxyState, backend: &Backend, bucket: &str) -> Check
         copy_preserves_metadata_probe(state, backend, bucket, &prefix).await,
         checksum_header_probe(state, backend, bucket, &prefix).await,
         multipart_small_final_part_probe(state, backend, bucket, &prefix).await,
+        lifecycle_abort_rule_probe(state, backend, bucket).await,
     ];
 
     CheckReport { probes }
@@ -721,6 +724,152 @@ async fn abort_upload(state: &ProxyState, backend: &Backend, path: &str, encoded
     .await;
 }
 
+/// Read-only probe: does the bucket have a lifecycle rule that aborts an
+/// incomplete multipart upload? `s3armor` does not walk the bucket for
+/// orphaned multipart uploads (docs/ARCHITECTURE.md "Garbage collection")
+/// — this rule is the backend's own collector for that garbage. The probe
+/// writes nothing; it only reads the bucket's lifecycle configuration.
+async fn lifecycle_abort_rule_probe(state: &ProxyState, backend: &Backend, bucket: &str) -> Probe {
+    let name = "lifecycle rule aborts incomplete multipart uploads";
+    let path = format!("/{bucket}");
+    let resp = match forward(
+        state,
+        backend,
+        "GET",
+        &path,
+        "lifecycle",
+        Vec::new(),
+        body::empty(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Probe {
+                name,
+                status: Status::Warn(format!("could not read the lifecycle configuration: {e}")),
+            }
+        }
+    };
+    let status_code = resp.status().as_u16();
+    let server = header_owned(&to_pairs(resp.headers()), "server");
+    let body_bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    Probe {
+        name,
+        status: classify_lifecycle(status_code, server.as_deref(), &body_bytes),
+    }
+}
+
+/// Turns a `GetBucketLifecycleConfiguration` response into a `Status`. Pure:
+/// no network, so `lifecycle_abort_rule_probe` supplies the response.
+///
+/// MinIO drops the `AbortIncompleteMultipartUpload` field with no error and
+/// expires stale multipart uploads on its own (docs/ARCHITECTURE.md
+/// "Garbage collection"), so a `Server` header that names MinIO is `Ok`
+/// before the status or the body matter at all. A missing rule costs
+/// money; it does not break correctness, so this never returns
+/// `Status::Fail`.
+fn classify_lifecycle(status: u16, server: Option<&str>, body: &[u8]) -> Status {
+    if server.is_some_and(|s| s.to_ascii_lowercase().contains("minio")) {
+        return Status::Ok;
+    }
+    match status {
+        200 if has_enabled_abort_rule(body) => Status::Ok,
+        200 => Status::Warn(
+            "no lifecycle rule aborts incomplete multipart uploads — orphaned multipart parts \
+             stay billed until one does"
+                .to_string(),
+        ),
+        404 => Status::Warn(
+            "no lifecycle configuration is set on the bucket — orphaned multipart parts stay \
+             billed until a rule aborts incomplete multipart uploads"
+                .to_string(),
+        ),
+        403 => Status::Warn(
+            "GetBucketLifecycleConfiguration returned 403 — the credential needs the \
+             s3:GetLifecycleConfiguration permission to read the rule"
+                .to_string(),
+        ),
+        other => Status::Warn(format!(
+            "cannot read the lifecycle configuration: HTTP {other}"
+        )),
+    }
+}
+
+/// True when the body has a `Rule` that is `Enabled` and carries an
+/// `AbortIncompleteMultipartUpload` element. Reads rule by rule with
+/// `quick_xml` events, as `tools/list.rs` parses a list response — a
+/// substring search over the whole body would wrongly accept a `Disabled`
+/// rule that still has the element.
+fn has_enabled_abort_rule(body: &[u8]) -> bool {
+    let xml = String::from_utf8_lossy(body);
+    let mut reader = Reader::from_str(&xml);
+    reader.config_mut().trim_text_start = true;
+    reader.config_mut().trim_text_end = true;
+
+    let mut scan = RuleScan::default();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => scan.start(e.name().as_ref()),
+            Ok(Event::Text(t)) => scan.text(&t.decode().unwrap_or_default()),
+            Ok(Event::End(e)) => {
+                if scan.end(e.name().as_ref()) {
+                    return true;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+/// The state of `has_enabled_abort_rule` in one `Rule` element. The event
+/// handlers are methods, so the event loop stays under the Sonar S3776
+/// complexity limit.
+#[derive(Default)]
+struct RuleScan {
+    tag: Vec<u8>,
+    in_rule: bool,
+    enabled: bool,
+    has_abort: bool,
+}
+
+impl RuleScan {
+    /// Records the element name. A `Rule` start resets both flags.
+    fn start(&mut self, name: &[u8]) {
+        self.tag.clear();
+        self.tag.extend_from_slice(name);
+        if name == b"Rule" {
+            self.in_rule = true;
+            self.enabled = false;
+            self.has_abort = false;
+        } else if self.in_rule && name == b"AbortIncompleteMultipartUpload" {
+            self.has_abort = true;
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        if self.in_rule && self.tag == b"Status" && text.trim() == "Enabled" {
+            self.enabled = true;
+        }
+    }
+
+    /// Returns true at the end of a rule that is enabled and has the abort
+    /// element.
+    fn end(&mut self, name: &[u8]) -> bool {
+        if name != b"Rule" {
+            return false;
+        }
+        self.in_rule = false;
+        self.enabled && self.has_abort
+    }
+}
+
 async fn delete(state: &ProxyState, backend: &Backend, bucket: &str, key: &str) {
     let path = format!("/{bucket}/{}", encode_key_for_path(key));
     let _ = forward(
@@ -733,4 +882,256 @@ async fn delete(state: &ProxyState, backend: &Backend, bucket: &str, key: &str) 
         body::empty(),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_minio_server_header_is_ok() {
+        // The server-header rule wins before status or body matter — a
+        // 403 with no lifecycle body still classifies as `Ok`.
+        assert!(matches!(
+            classify_lifecycle(404, Some("MinIO"), b""),
+            Status::Ok
+        ));
+        assert!(matches!(
+            classify_lifecycle(403, Some("minio/RELEASE.2024-01-01"), b""),
+            Status::Ok
+        ));
+    }
+
+    #[test]
+    fn an_enabled_abort_rule_is_ok() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>abort-mpu</ID>
+    <Status>Enabled</Status>
+    <Filter><Prefix></Prefix></Filter>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>"#;
+        assert!(matches!(classify_lifecycle(200, None, body), Status::Ok));
+    }
+
+    #[test]
+    fn a_disabled_abort_rule_warns() {
+        let body = br"<LifecycleConfiguration>
+  <Rule>
+    <ID>abort-mpu</ID>
+    <Status>Disabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>";
+        assert!(matches!(
+            classify_lifecycle(200, None, body),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_lifecycle_with_no_abort_rule_warns() {
+        let body = br"<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-old</ID>
+    <Status>Enabled</Status>
+    <Expiration><Days>30</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>";
+        assert!(matches!(
+            classify_lifecycle(200, None, body),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_lifecycle_configuration_warns() {
+        assert!(matches!(
+            classify_lifecycle(404, None, b""),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_forbidden_lifecycle_read_warns_and_names_the_permission() {
+        match classify_lifecycle(403, None, b"") {
+            Status::Warn(msg) => assert!(msg.contains("s3:GetLifecycleConfiguration")),
+            _ => panic!("expected Warn"),
+        }
+    }
+
+    #[test]
+    fn an_unexpected_status_warns() {
+        match classify_lifecycle(500, None, b"") {
+            Status::Warn(msg) => assert!(msg.contains("500")),
+            _ => panic!("expected Warn"),
+        }
+    }
+
+    const ENABLED_ABORT_RULE: &[u8] = br"<LifecycleConfiguration>
+  <Rule>
+    <Status>Enabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>";
+
+    #[test]
+    fn a_disabled_rule_does_not_hide_a_later_enabled_abort_rule() {
+        let body = br"<LifecycleConfiguration>
+  <Rule>
+    <Status>Disabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+  <Rule>
+    <Status>Enabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>";
+        // Guards: `has_enabled_abort_rule` goes on to the next rule after a failed `</Rule>`.
+        assert!(matches!(classify_lifecycle(200, None, body), Status::Ok));
+    }
+
+    #[test]
+    fn flags_do_not_leak_between_rules() {
+        let body = br"<LifecycleConfiguration>
+  <Rule>
+    <Status>Enabled</Status>
+    <Expiration><Days>30</Days></Expiration>
+  </Rule>
+  <Rule>
+    <Status>Disabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>";
+        // Guards: each `<Rule>` start resets `rule_enabled` and `rule_has_abort`.
+        assert!(matches!(
+            classify_lifecycle(200, None, body),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn the_status_element_can_come_after_the_abort_element() {
+        let body = br"<LifecycleConfiguration>
+  <Rule>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+    <Status>Enabled</Status>
+  </Rule>
+</LifecycleConfiguration>";
+        // Guards: the decision waits for `</Rule>`, so element order does not matter.
+        assert!(matches!(classify_lifecycle(200, None, body), Status::Ok));
+    }
+
+    #[test]
+    fn the_s3_default_namespace_is_accepted() {
+        let body = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <Status>Enabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>"#;
+        // Guards: a default namespace does not add a prefix to `e.name()`.
+        assert!(matches!(classify_lifecycle(200, None, body), Status::Ok));
+    }
+
+    #[test]
+    fn whitespace_around_the_status_text_is_ignored() {
+        let body = b"<LifecycleConfiguration><Rule><Status>\n    Enabled\n</Status>\
+<AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+</AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>";
+        // Guards: the `d.trim() == "Enabled"` comparison.
+        assert!(matches!(classify_lifecycle(200, None, body), Status::Ok));
+    }
+
+    #[test]
+    fn a_lowercase_status_is_not_enabled() {
+        let body = br"<LifecycleConfiguration>
+  <Rule>
+    <Status>enabled</Status>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>";
+        // Guards: the status match is exact. A wrong case warns; it does not pass.
+        assert!(matches!(
+            classify_lifecycle(200, None, body),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_self_closing_abort_element_does_not_count() {
+        let body = br"<LifecycleConfiguration>
+  <Rule>
+    <Status>Enabled</Status>
+    <AbortIncompleteMultipartUpload/>
+  </Rule>
+</LifecycleConfiguration>";
+        // Guards: only `Event::Start` sets `rule_has_abort`. A rule with no days is not valid.
+        assert!(matches!(
+            classify_lifecycle(200, None, body),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_body_truncated_inside_the_rule_warns() {
+        let body = b"<LifecycleConfiguration><Rule><Status>Enabled</Status>\
+<AbortIncompleteMultipartUpload><DaysAfterInitiation>7";
+        // Guards: `Eof` or a parse error before `</Rule>` ends the loop with `false`.
+        assert!(matches!(
+            classify_lifecycle(200, None, body),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn an_empty_body_with_status_200_warns() {
+        // Guards: the `200 =>` arm when no rule is found.
+        assert!(matches!(
+            classify_lifecycle(200, None, b""),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_body_that_is_not_utf8_warns_and_does_not_panic() {
+        // Guards: `String::from_utf8_lossy` in `has_enabled_abort_rule`.
+        assert!(matches!(
+            classify_lifecycle(200, None, b"\xff\xfe\x00not xml"),
+            Status::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_server_header_that_is_not_minio_changes_nothing() {
+        // Guards: only a server name that contains "minio" skips the status and body checks.
+        assert!(matches!(
+            classify_lifecycle(404, Some("AmazonS3"), b""),
+            Status::Warn(_)
+        ));
+        assert!(matches!(
+            classify_lifecycle(200, Some("AmazonS3"), ENABLED_ABORT_RULE),
+            Status::Ok
+        ));
+    }
 }

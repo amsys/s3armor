@@ -43,7 +43,7 @@ use s3armor_format::v1::{ciphertext_len, encrypt_all, Alg, Footer, ObjectMeta};
 
 use crate::config::Backend;
 use crate::intercept::{header_u64, normalize_etag, set_response_header, write_binding};
-use crate::mpu::{CachedComplete, PartRecord, Session, SessionKey};
+use crate::mpu::{CachedComplete, Session, SessionKey};
 use crate::proxy::body::{self, ProxyBody};
 use crate::proxy::error::S3Error;
 use crate::proxy::headers::to_pairs;
@@ -100,7 +100,9 @@ pub async fn handle_create(
 ) -> Result<Response<ProxyBody>, S3Error> {
     // Reject before initiating a backend upload, so a node already at the
     // session cap does not leave an orphaned multipart upload behind.
-    if state.sessions.len() >= crate::mpu::MAX_SESSIONS {
+    // `make_room` first evicts the oldest finished session, so a burst of
+    // completions does not block new uploads for the rest of the TTL.
+    if !state.sessions.make_room() {
         return Err(S3Error::slow_down());
     }
     let alg = state.config.alg;
@@ -153,8 +155,9 @@ pub async fn handle_create(
         alg,
         chunk_size,
     ) {
-        // Lost a race against the cap after the backend initiated the upload.
-        // The backend's own incomplete-upload lifecycle reclaims the orphan.
+        // Lost a race against the cap (no finished session was left to
+        // evict) after the backend initiated the upload. The backend's own
+        // incomplete-upload lifecycle reclaims the orphan.
         return Err(S3Error::slow_down());
     }
     state.record_mpu_session_created();
@@ -198,7 +201,10 @@ pub async fn handle_upload_part(
             .sessions
             .get(&session_key)
             .ok_or_else(|| S3Error::no_such_upload(&upload_id))?;
-        (entry.dek, entry.alg, entry.chunk_size)
+        let dek = entry
+            .dek
+            .ok_or_else(|| S3Error::no_such_upload(&upload_id))?;
+        (dek, entry.alg, entry.chunk_size)
     };
 
     let pt_len = header_u64(&outbound_headers, "content-length")
@@ -290,10 +296,9 @@ pub async fn handle_upload_part(
     Ok(translate_response(backend_resp, request_id))
 }
 
-/// Records a completed part and applies the tail-buffer rule: every
-/// sub-5-MiB part's ciphertext is buffered (capped, `Session::buffer_tail`)
-/// so Complete can find whichever part it actually finishes with; a part
-/// re-uploaded at >= 5 MiB clears its own stale buffer entry.
+/// Delegates to `Session::record_part`, which does nothing once the
+/// session has already finished — a late, concurrent UploadPart must not
+/// repopulate state a Complete already cleared.
 fn record_part(
     state: &ProxyState,
     session_key: &SessionKey,
@@ -303,14 +308,7 @@ fn record_part(
     ct: Option<Bytes>,
 ) {
     if let Some(mut entry) = state.sessions.get_mut(session_key) {
-        entry.parts.insert(part_number, PartRecord { pt_len, etag });
-        match ct {
-            Some(c) => entry.buffer_tail(part_number, c),
-            None => {
-                entry.tails.remove(&part_number);
-            }
-        }
-        entry.touch();
+        entry.record_part(part_number, pt_len, etag, ct);
     }
 }
 
@@ -318,7 +316,9 @@ fn record_part(
 /// node recorded, upload the footer (merged into the buffered tail, or as
 /// its own extra part), and complete. A retried Complete (real SDKs retry
 /// it) returns the cached response instead of `NoSuchUpload` — the session
-/// is never deleted here, only marked completed and left to expire by TTL.
+/// is never deleted here. `Session::finish` releases its DEK, parts and
+/// tails at once and keeps only the cached response, which stays until TTL
+/// sweeps it or `Sessions::make_room` evicts it under cap pressure.
 pub async fn handle_complete(
     state: &ProxyState,
     backend: &Backend,
@@ -358,7 +358,7 @@ pub async fn handle_complete(
             drop(entry);
             return Ok(cached_response(cached, request_id));
         }
-        snapshot_for_complete(&entry, &client_parts, last_number)?
+        snapshot_for_complete(&entry, &client_parts, last_number, &upload_id)?
     };
 
     let total_pt: u64 = snap.parts.iter().map(|(_, size)| *size).sum();
@@ -475,6 +475,7 @@ fn snapshot_for_complete(
     entry: &Session,
     client_parts: &[(u32, String)],
     last_number: u32,
+    upload_id: &str,
 ) -> Result<PartsSnapshot, S3Error> {
     for (number, client_etag) in client_parts {
         let recorded = entry
@@ -496,9 +497,12 @@ fn snapshot_for_complete(
         .map(|(n, _)| (*n, entry.parts[n].pt_len))
         .collect();
     let tail = entry.tails.get(&last_number).cloned();
+    let dek = entry
+        .dek
+        .ok_or_else(|| S3Error::no_such_upload(upload_id))?;
     Ok(PartsSnapshot {
         alg: entry.alg,
-        dek: entry.dek,
+        dek,
         chunk_size: entry.chunk_size,
         parts: parts_snapshot,
         tail,
@@ -646,12 +650,11 @@ async fn complete_upload(
 
     if let Some(mut entry) = state.sessions.get_mut(session_key) {
         if parts.status.is_success() {
-            entry.completed = Some(CachedComplete {
+            entry.finish(CachedComplete {
                 status: parts.status,
                 headers: to_pairs(&parts.headers),
                 body: out_bytes.clone(),
             });
-            entry.touch();
         } else {
             // `forward` returns Ok for any backend HTTP status, so a
             // non-2xx Complete (e.g. a transient 503) reaches here as a
