@@ -1,0 +1,85 @@
+{
+  "goal": "CI on main stays green, the SonarCloud job is skipped on Dependabot PRs, Dependabot stops proposing the digest-0.11 RustCrypto bumps while rsa is tied to digest 0.10, and PRs #2-#5 are closed.",
+  "unknowns": [
+    {
+      "text": "User chose to hold RustCrypto at the digest-0.10 generation until rsa 0.10 is stable (only 0.10.0-rc.18 exists on 2026-09-18). No Rust code or Cargo file changes.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "User chose to skip sonarcloud for dependabot[bot] rather than add SONAR_TOKEN as a Dependabot secret.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "Dependabot counts 0.10 -> 0.11 as version-update:semver-minor, so ignoring semver-minor and semver-major for the five crates still lets patch updates through.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "PRs #1 (tokio-rustls) and #6 (lru) fail only on sonarcloud. User did not approve a rebase comment; they stay red until Dependabot rebases them or the user asks.",
+      "resolve": "assume-and-flag"
+    },
+    {
+      "text": "The pre-push cargo-test and cargo-deny hooks match only rust and Cargo files, so a YAML-only push does not run the Docker suites.",
+      "resolve": "assume-and-flag"
+    }
+  ],
+  "success_criteria": [
+    ".github/workflows/ci.yml: the sonarcloud job if-condition keeps the fork-PR clause and adds github.actor != 'dependabot[bot]'",
+    ".github/dependabot.yml: an ignore entry for sha2, hkdf, hmac, md-5 and aes-gcm with update-types semver-minor and semver-major, with an STE comment that names rsa 0.10 stable as the release that lifts it",
+    "git diff HEAD~N shows no change under crates/, Cargo.toml or Cargo.lock",
+    "origin/main equals local HEAD after the push, and the CI run for that commit concludes success",
+    "gh pr view 2..5 each report state CLOSED"
+  ],
+  "scope_fence": [
+    "No change to any Rust source, Cargo.toml, Cargo.lock or deny.toml",
+    "No change to other ci.yml jobs, action versions or sonar-project.properties",
+    "No repository or Dependabot secret changes",
+    "No comment, merge or rebase on PR #1 or PR #6",
+    "No force-push"
+  ],
+  "registration_files": [],
+  "budget": {
+    "escalations_max": 2
+  },
+  "steps": [
+    {
+      "id": "sonar-skip",
+      "action": "In .github/workflows/ci.yml, job sonarcloud: change the if-condition to `github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')`. Add one STE sentence to the comment above it: Dependabot PRs also get no Actions secrets, so the job is skipped there too; it scans the merge on main. Touch nothing else.",
+      "files": [".github/workflows/ci.yml"],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "CI config: a wrong condition silently stops Sonar on every push.",
+      "done_check": "python3 -c \"import yaml; c=yaml.safe_load(open('.github/workflows/ci.yml'))['jobs']['sonarcloud']['if']; assert \\\"github.event_name == 'push'\\\" in c, c; assert 'head.repo.full_name == github.repository' in c, c; assert \\\"github.actor != 'dependabot[bot]'\\\" in c, c; print('ok', c)\" && git diff --stat -- .github/workflows/ci.yml"
+    },
+    {
+      "id": "dependabot-hold",
+      "action": "In .github/dependabot.yml, add to the cargo updates entry an `ignore:` list with one item per crate (sha2, hkdf, hmac, md-5, aes-gcm), each with update-types [\"version-update:semver-minor\", \"version-update:semver-major\"]. Put an STE comment above it: these crates must move to digest 0.11 together with rsa; rsa 0.9 uses digest 0.10 and our OAEP key wrap uses Sha256 through it; remove this ignore when rsa 0.10 is stable. Keep the existing keys.",
+      "files": [".github/dependabot.yml"],
+      "depends_on": [],
+      "reversibility": "cheap",
+      "blast_radius": "system",
+      "reason": "Controls which automated PRs open; a wrong ignore hides security patch updates for crypto crates.",
+      "done_check": "python3 -c \"import yaml; u=yaml.safe_load(open('.github/dependabot.yml'))['updates'][0]; assert u['package-ecosystem']=='cargo' and u['schedule']['interval']=='weekly'; ig={i['dependency-name']: sorted(i['update-types']) for i in u['ignore']}; want=['version-update:semver-major','version-update:semver-minor']; assert set(ig)=={'sha2','hkdf','hmac','md-5','aes-gcm'}, ig; assert all(v==want for v in ig.values()), ig; print('ok', ig)\" && grep -n 'rsa' .github/dependabot.yml"
+    },
+    {
+      "id": "push",
+      "action": "Confirm `git status --porcelain --untracked-files=no` is empty and `git log origin/main..HEAD --name-only --format=` lists only .github/workflows/ci.yml and .github/dependabot.yml. Untracked files stay local. Then run `git push origin main`. No force.",
+      "files": [],
+      "depends_on": ["sonar-skip", "dependabot-hold"],
+      "reversibility": "irreversible",
+      "blast_radius": "external",
+      "reason": "Publishes to the shared remote; a push cannot be taken back without a force-push.",
+      "done_check": "git fetch -q origin && test \"$(git rev-parse HEAD)\" = \"$(git rev-parse origin/main)\" && git log -3 --oneline origin/main"
+    },
+    {
+      "id": "close-prs",
+      "action": "For each of PRs 2, 3, 4, 5 run `gh pr close <n> --comment \"Held: sha2/hkdf/hmac/md-5/aes-gcm must move to digest 0.11 together, and rsa 0.9 (latest stable) still uses digest 0.10. .github/dependabot.yml now ignores these minor bumps until rsa 0.10 is stable.\"`. Do not touch PR 1 or PR 6.",
+      "files": [],
+      "depends_on": ["push"],
+      "reversibility": "irreversible",
+      "blast_radius": "external",
+      "reason": "Changes public PR state and posts comments on GitHub.",
+      "done_check": "for n in 2 3 4 5; do gh pr view $n --json number,state -q '\"\\(.number) \\(.state)\"'; done; for n in 1 6; do gh pr view $n --json number,state -q '\"\\(.number) \\(.state)\"'; done"
+    }
+  ]
+}
