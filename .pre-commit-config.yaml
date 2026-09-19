@@ -40,11 +40,15 @@ repos:
     hooks:
       - id: gitleaks
 
-  - repo: https://github.com/koalaman/shellcheck-precommit
-    rev: v0.11.0
+  # The host shellcheck, not the upstream hook: that hook runs shellcheck
+  # in a Docker container, and it fails where Docker needs sudo.
+  - repo: local
     hooks:
       - id: shellcheck
-        args: [--severity=style, --external-sources]
+        name: shellcheck
+        entry: shellcheck --severity=style --external-sources
+        language: system
+        types: [shell]
 
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.4.0

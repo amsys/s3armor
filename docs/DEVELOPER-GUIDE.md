@@ -453,6 +453,9 @@ enforced by hooks, not left to memory. Install them once per clone:
 pre-commit install --install-hooks
 ```
 
+The hooks call `cargo`, `cargo-deny`, and `shellcheck` from your `PATH`.
+Install `shellcheck` with your package manager before the first commit.
+
 `.pre-commit-config.yaml` runs `cargo fmt`, `cargo clippy -D warnings`, and
 the hygiene/secret-scan hooks on every commit; it runs `cargo test` and
 `cargo deny check` on every push. CI re-runs the same checks (plus

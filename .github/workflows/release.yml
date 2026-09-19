@@ -22,7 +22,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The packages take their version from Cargo.toml; the binary name and
+      # the image tag take it from the git tag. Stop the release when the two
+      # differ, before this job or `publish` makes anything.
+      - name: Check that the tag matches the Cargo.toml version
+        run: |
+          PKGID="$(cargo pkgid -p s3armor)"
+          CARGO_VERSION="${PKGID##*[#@]}"
+          if [ "${GITHUB_REF_NAME#v}" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -46,7 +58,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: scripts/package-check.sh
       - id: version
@@ -70,17 +82,18 @@ jobs:
             --clobber
 
   publish:
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -94,7 +107,7 @@ jobs:
       # linux/arm64 alongside amd64: the docs point at a low-power ARM NAS
       # as a deployment target (docs/ARCHITECTURE.md "Optimizations"),
       # which an amd64-only image would not actually serve.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: Containerfile
