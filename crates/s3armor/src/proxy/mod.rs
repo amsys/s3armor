@@ -243,7 +243,7 @@ pub async fn handle(
     match body::with_abort_slot(handle_inner(&state, req, &request_id, peer_ip)).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
-            tracing::warn!(request_id, code = e.code, message = %e.message, "request failed");
+            tracing::warn!(request_id, code = e.code, error = %e.message, "request failed");
             Ok(e.into_response(&request_id))
         }
     }
