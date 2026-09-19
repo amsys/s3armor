@@ -7,6 +7,10 @@
 # Some machines put Docker behind sudo. Run a script with
 # DOCKER="sudo docker" scripts/<name>.sh to use it there.
 read -r -a DOCKER_CMD <<<"${DOCKER:-docker}"
+[ "${#DOCKER_CMD[@]}" -gt 0 ] || {
+  echo "DOCKER is set but empty" >&2
+  exit 1
+}
 command -v "${DOCKER_CMD[0]}" >/dev/null || {
   echo "missing required tool: ${DOCKER_CMD[0]}" >&2
   exit 1

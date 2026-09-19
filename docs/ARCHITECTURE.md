@@ -354,10 +354,12 @@ keyed by the wrapped DEK bytes themselves — content-addressed, so it cannot
 go stale the way a key-plus-object-name cache would — bounded, TTL'd, and
 zeroizing on eviction. Build that only once a benchmark demands it.
 
-`zeroize` is used at exactly four sites: the `MasterKey` type derives
+`zeroize` is used at exactly five sites: the `MasterKey` type derives
 `ZeroizeOnDrop`; the HKDF-derived KEK copy is zeroized immediately after
-the cipher is built from it; and a multipart session's DEK is zeroized at a
-successful Complete ("Garbage collection") and again on `Drop`. Every other
+the cipher is built from it, once in `MasterKey::wrap` and once in
+`MasterKey::unwrap`; and a multipart session's DEK is zeroized at a
+successful Complete (`Session::finish`, "Garbage collection") and again on
+`Drop`. Every other
 DEK in the system — the one a PUT or multipart-create
 mints, the one key resolution returns, the copy each streaming encryptor or
 decryptor holds for the life of one request body — is a bare 32-byte array
@@ -667,7 +669,7 @@ s3armor check
   ✓ CopyObject preserves user metadata (passthrough-copy soundness)
   ✓ checksum trailer behavior with CRC32-on SDK
   ✓ bucket lifecycle rule aborts incomplete multipart uploads (read-only)
-  → verdict: compatible / degraded (what breaks) / incompatible
+  → verdict: compatible / degraded (works, each warning named) / incompatible
 ```
 
 Each probe maps to a specific format or protocol requirement. A failure

@@ -781,8 +781,8 @@ fn classify_lifecycle(status: u16, server: Option<&str>, body: &[u8]) -> Status 
     match status {
         200 if has_enabled_abort_rule(body) => Status::Ok,
         200 => Status::Warn(
-            "no lifecycle rule aborts incomplete multipart uploads — orphaned multipart parts \
-             stay billed until one does"
+            "no lifecycle rule aborts incomplete multipart uploads for the whole bucket — \
+             orphaned multipart parts stay billed until one does"
                 .to_string(),
         ),
         404 => Status::Warn(
@@ -801,8 +801,9 @@ fn classify_lifecycle(status: u16, server: Option<&str>, body: &[u8]) -> Status 
     }
 }
 
-/// True when the body has a `Rule` that is `Enabled` and carries an
-/// `AbortIncompleteMultipartUpload` element. Reads rule by rule with
+/// True when the body has a `Rule` that is `Enabled`, carries an
+/// `AbortIncompleteMultipartUpload` element and has no filter that limits
+/// it to part of the bucket. Reads rule by rule with
 /// `quick_xml` events, as `tools/list.rs` parses a list response — a
 /// substring search over the whole body would wrongly accept a `Disabled`
 /// rule that still has the element.
@@ -832,15 +833,32 @@ fn has_enabled_abort_rule(body: &[u8]) -> bool {
 /// handlers are methods, so the event loop stays under the Sonar S3776
 /// complexity limit.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact about one rule, not a state of a state machine"
+)]
 struct RuleScan {
     tag: Vec<u8>,
     in_rule: bool,
     enabled: bool,
     has_abort: bool,
+    /// The rule applies to part of the bucket only. Uploads outside its
+    /// filter stay billed.
+    narrowed: bool,
 }
 
+/// Filter elements that limit a rule to part of the bucket. `Prefix` is
+/// not in this list: an empty `Prefix` applies to the whole bucket, so
+/// `RuleScan::text` checks it.
+const NARROWING_ELEMENTS: [&[u8]; 4] = [
+    b"Tag",
+    b"And",
+    b"ObjectSizeGreaterThan",
+    b"ObjectSizeLessThan",
+];
+
 impl RuleScan {
-    /// Records the element name. A `Rule` start resets both flags.
+    /// Records the element name. A `Rule` start resets all flags.
     fn start(&mut self, name: &[u8]) {
         self.tag.clear();
         self.tag.extend_from_slice(name);
@@ -848,25 +866,35 @@ impl RuleScan {
             self.in_rule = true;
             self.enabled = false;
             self.has_abort = false;
+            self.narrowed = false;
         } else if self.in_rule && name == b"AbortIncompleteMultipartUpload" {
             self.has_abort = true;
+        } else if self.in_rule && NARROWING_ELEMENTS.contains(&name) {
+            self.narrowed = true;
         }
     }
 
+    /// Reads the `Status` text and the `Prefix` text. The reader trims
+    /// text, so an empty `Prefix` gives no text event.
     fn text(&mut self, text: &str) {
-        if self.in_rule && self.tag == b"Status" && text.trim() == "Enabled" {
+        if !self.in_rule {
+            return;
+        }
+        if self.tag == b"Status" && text.trim() == "Enabled" {
             self.enabled = true;
+        } else if self.tag == b"Prefix" && !text.is_empty() {
+            self.narrowed = true;
         }
     }
 
-    /// Returns true at the end of a rule that is enabled and has the abort
-    /// element.
+    /// Returns true at the end of a rule that is enabled, has the abort
+    /// element and applies to the whole bucket.
     fn end(&mut self, name: &[u8]) -> bool {
         if name != b"Rule" {
             return false;
         }
         self.in_rule = false;
-        self.enabled && self.has_abort
+        self.enabled && self.has_abort && !self.narrowed
     }
 }
 
@@ -1133,5 +1161,61 @@ mod tests {
             classify_lifecycle(200, Some("AmazonS3"), ENABLED_ABORT_RULE),
             Status::Ok
         ));
+    }
+
+    /// `ENABLED_ABORT_RULE` with `extra` put at the start of its rule.
+    fn abort_rule_with(extra: &str) -> Vec<u8> {
+        String::from_utf8_lossy(ENABLED_ABORT_RULE)
+            .replace("<Rule>", &format!("<Rule>{extra}"))
+            .into_bytes()
+    }
+
+    fn lifecycle_status(body: &[u8]) -> Status {
+        classify_lifecycle(200, None, body)
+    }
+
+    #[test]
+    fn an_abort_rule_scoped_to_a_prefix_warns() {
+        let body = abort_rule_with("<Filter><Prefix>logs/</Prefix></Filter>");
+        // Guards: a `Prefix` with text narrows the rule.
+        match lifecycle_status(&body) {
+            Status::Warn(msg) => assert!(msg.contains("for the whole bucket")),
+            _ => panic!("expected Warn"),
+        }
+    }
+
+    #[test]
+    fn an_older_rule_level_prefix_warns() {
+        let body = abort_rule_with("<Prefix>logs/</Prefix>");
+        // Guards: the older `<Rule><Prefix>` form narrows the rule too.
+        assert!(matches!(lifecycle_status(&body), Status::Warn(_)));
+    }
+
+    #[test]
+    fn an_abort_rule_with_an_and_filter_warns() {
+        let body = abort_rule_with(
+            "<Filter><And><Tag><Key>a</Key><Value>1</Value></Tag>\
+             <ObjectSizeGreaterThan>1024</ObjectSizeGreaterThan></And></Filter>",
+        );
+        // Guards: `And`, `Tag` and `ObjectSizeGreaterThan` are in `NARROWING_ELEMENTS`.
+        assert!(matches!(lifecycle_status(&body), Status::Warn(_)));
+    }
+
+    #[test]
+    fn an_empty_self_closing_filter_is_ok() {
+        let body = abort_rule_with("<Filter/>");
+        // Guards: an empty filter applies to the whole bucket.
+        assert!(matches!(lifecycle_status(&body), Status::Ok));
+    }
+
+    #[test]
+    fn a_narrowed_rule_does_not_hide_a_later_bucket_wide_rule() {
+        let body = abort_rule_with(
+            "<Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>\
+             <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+             </AbortIncompleteMultipartUpload></Rule><Rule>",
+        );
+        // Guards: each `<Rule>` start resets `narrowed`.
+        assert!(matches!(lifecycle_status(&body), Status::Ok));
     }
 }

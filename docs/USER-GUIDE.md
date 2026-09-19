@@ -567,7 +567,10 @@ when the proxy restarts or a session expires. A restart loses the in-memory
 multipart session state, and any uploads it started stay on the backend
 until a backend lifecycle rule removes them. Set a bucket lifecycle rule
 with the action `AbortIncompleteMultipartUpload` to clean up these orphaned
-parts and stop the billing clock on them. The number of days must be longer
+parts and stop the billing clock on them. The rule must apply to the whole
+bucket, so its filter must be empty. `s3armor check` gives a warning for a
+rule that has a `Prefix` with text, a `Tag`, an `And` or an object size
+limit, because uploads outside that filter stay billed. The number of days must be longer
 than the longest multipart upload the operator expects. The backend counts
 from the start of the upload, not from each part's timestamp.
 
@@ -587,7 +590,10 @@ Example rule in lifecycle XML:
 **MinIO exception:** MinIO ignores the `AbortIncompleteMultipartUpload` field
 with no error and removes stale uploads on its own via `api stale_uploads_expiry`
 (default 24 hours). `s3armor check` reports this configuration as working on
-MinIO.
+MinIO. It finds MinIO only from the `Server` response header. A reverse
+proxy in front of MinIO can remove or replace that header. Then `s3armor
+check` gives a warning about the lifecycle rule. On MinIO, you can ignore
+that warning.
 
 If the credentials cannot read the bucket's lifecycle configuration, `s3armor
 check` gives a warning and names the missing permission: `s3:GetLifecycleConfiguration`.
@@ -610,7 +616,8 @@ metadata headroom for your key type, multipart uploads with a small
 final part are accepted, ranged GET works, CopyObject preserves user
 metadata, checksum trailers behave as expected, and the bucket has a
 lifecycle rule that aborts incomplete multipart uploads. It prints a
-verdict: compatible, degraded (naming what breaks), or incompatible.
+verdict: compatible, degraded (works, with each warning named), or
+incompatible.
 
 **Exit code reflects only `incompatible`.** `compatible` and `degraded`
 both exit `0` — a `degraded` backend still works, just with a named

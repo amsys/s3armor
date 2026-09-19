@@ -432,33 +432,14 @@ mod tests {
 
     #[test]
     fn make_room_at_the_cap_evicts_the_oldest_finished_session() {
-        let sessions = Sessions::new();
-        for i in 0..MAX_SESSIONS - 2 {
-            assert!(sessions.create(open_key(i), [0u8; 32], Alg::Aes256Gcm, 1024));
-        }
-        let older = (
-            "DEFAULT".to_string(),
-            "b".to_string(),
-            "older".to_string(),
-            "u-older".to_string(),
-        );
-        let newer = (
-            "DEFAULT".to_string(),
-            "b".to_string(),
-            "newer".to_string(),
-            "u-newer".to_string(),
-        );
-        assert!(sessions.create(older.clone(), [0x01; 32], Alg::Aes256Gcm, 1024));
-        assert!(sessions.create(newer.clone(), [0x02; 32], Alg::Aes256Gcm, 1024));
+        let sessions = at_the_cap_with_finished(&["older", "newer"]);
+        let older = named_key("older");
+        let newer = named_key("newer");
         assert_eq!(sessions.len(), MAX_SESSIONS);
 
-        // Finish both, then push the older one's activity further back —
-        // `finish` itself touches `last_activity`, so this must happen
-        // after, not before.
-        sessions.get_mut(&older).unwrap().finish(cached());
-        sessions.get_mut(&newer).unwrap().finish(cached());
-        sessions.get_mut(&older).unwrap().last_activity =
-            Instant::now().checked_sub(Duration::from_hours(2)).unwrap();
+        // The helper finishes both sessions. `finish` touches
+        // `last_activity`, so move the older one back after that.
+        sessions.get_mut(&older).unwrap().last_activity = two_hours_ago();
 
         assert!(sessions.make_room());
 
