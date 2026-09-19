@@ -116,6 +116,13 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
+      # The shellcheck hook uses the shellcheck on PATH. The runner image
+      # ships an older one that reports other findings, so install the
+      # version that local hooks use.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: shellcheck@0.11.0
+      - run: "shellcheck --version | grep -q 'version: 0.11.0'"
       # fmt/clippy already run, cached, in their own jobs above — skip them
       # here so this job is just the hygiene/secret/shellcheck/commit-msg
       # hooks for anyone who skipped `pre-commit install` locally.
