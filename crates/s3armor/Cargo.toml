@@ -52,7 +52,7 @@ dashmap = "6"
 lru = "0.18"
 httpdate = "1"
 pprof = { version = "0.15", default-features = false, features = ["flamegraph"], optional = true }
-toml = "0.8"
+toml = "1.1"
 
 [dev-dependencies]
 s3armor-format = { path = "../s3armor-format", version = "0.2.0", features = ["test-util"] }
