@@ -37,7 +37,7 @@ futures-util = "0.3"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-quick-xml = "0.41"
+quick-xml = "0.42"
 percent-encoding = "2"
 hmac = "0.12"
 sha2 = "0.10"
