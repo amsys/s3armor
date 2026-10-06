@@ -11,60 +11,56 @@
   <img src="https://img.shields.io/badge/status-beta-orange" alt="Status: beta">
 </p>
 
-A small, fast client-side encryption proxy for S3-compatible storage
-(Hetzner Object Storage, MinIO, AWS, Ceph RGW). "Server-side encryption"
-leaves the key with the storage operator. This proxy makes the ciphertext
-the only thing the operator ever sees.
-
-Built for a homelab or a small private cluster: one static binary, flat
-environment-variable or `config.toml` configuration, no external database,
-no control plane. Point your S3 client at s3armor instead of your bucket,
-and every object your client writes becomes ciphertext before it ever
-leaves your network.
+s3armor is a small encryption proxy for S3-compatible storage. It encrypts
+every object on your side, before the object leaves your network. The
+storage operator gets ciphertext and nothing else.
 
 ## Why
 
-Storage-side encryption protects your data from a stranger who steals a
-disk. It does nothing against the storage operator itself, or anyone who
-can subpoena, breach, or misconfigure their account. Client-side
-encryption closes that gap: the key never leaves your control, so the
-operator holds ciphertext and nothing else.
+S3 "server-side encryption" asks you to hand the key to the same server
+that stores your data. With SSE-S3 and SSE-KMS the operator owns the key.
+With SSE-C you send your own key along with every request and trust the
+operator to forget it afterwards. In every variant, the party you want to
+protect the data from is the party that can read it. That defeats the
+point. It protects against a stolen disk and nothing more.
 
-## Features
+The fix is old and simple: encrypt before you upload. s3armor does this
+for the S3 clients you already use, so none of them have to change.
 
-- **Drop-in S3 proxy** — SigV4 request re-signing, so existing S3 clients
-  (aws-cli, rclone, restic, Nextcloud, Borgbackup) work unmodified.
-- **Authenticated encryption per object** — AES-256-GCM or XChaCha20-Poly1305,
-  picked automatically for the CPU it runs on.
-- **Streaming multipart** — large uploads encrypt part-by-part, no
-  whole-object buffering.
-- **Key rotation and write-only nodes** — rotate the active key without
-  re-encrypting existing objects; run an ingestion-only node that can
-  encrypt but never decrypt.
-- **TLS, metrics, rate limiting** — built in, no reverse proxy required.
+## How it works
 
-## Install
-
-```sh
-# Container image (hardened at runtime — see docs/USER-GUIDE.md)
-docker pull ghcr.io/amsys/s3armor:0.1
-
-# ...or .deb (Debian 12+), .apk (Alpine 3+), or static binary
-# Download from https://github.com/amsys/s3armor/releases
-
-# ...or build from source
-cargo build --release
 ```
+your app  --S3-->  s3armor  --S3-->  storage
+(Nextcloud,        holds the key,    sees only
+ restic, rclone,   encrypts and      ciphertext
+ aws-cli, ...)     decrypts
+```
+
+- **Clients stay unmodified.** The proxy verifies and re-signs every
+  request (SigV4). Nextcloud, Stalwart, restic, rclone, s3cmd and aws-cli
+  all speak to it as if it were the bucket.
+- **One key per object.** Each object gets its own key, wrapped by your
+  master key. AES-256-GCM or XChaCha20-Poly1305, chosen for the CPU.
+- **Large uploads stream.** Multipart uploads are encrypted part by part.
+  Nothing is buffered whole.
+- **Keys rotate.** Switch the active master key without re-encrypting
+  what is already stored. A write-only node can encrypt but never decrypt.
+- **One static binary.** TLS, metrics and rate limiting are built in. No
+  database, no control plane.
 
 ## Quickstart
 
 ```sh
-# 1. Generate a master key. Back this up now — it's the only way to read
-#    your data, and there is no recovery path if it's lost.
-openssl rand -base64 32
-# <base64 key printed here>
+# Install: container image, .deb, .apk or static binary.
+docker pull ghcr.io/amsys/s3armor:0.2.0
+# Packages and binaries: https://github.com/amsys/s3armor/releases
+# From source: cargo build --release
 
-# 2. Point it at a backend.
+# 1. Generate a master key. Back it up now. It is the only way to read
+#    your data, and there is no recovery if it is lost.
+openssl rand -base64 32
+
+# 2. Point at a backend.
 export S3A_BACKEND_ENDPOINT=https://fsn1.your-objectstorage.com
 export S3A_BACKEND_REGION=fsn1
 export S3A_BACKEND_ACCESS_KEY=...
@@ -72,37 +68,33 @@ export S3A_BACKEND_SECRET_KEY=...
 export S3A_KEY_ACTIVE=K1
 export S3A_KEY_K1=<the base64 line openssl printed>
 
-# 3. Give at least one client an inbound credential — with none configured
-#    every request is rejected.
+# 3. Give at least one client an inbound credential. With none
+#    configured every request is rejected.
 export S3A_CLIENT_APP_ACCESS_KEY=app
 export S3A_CLIENT_APP_SECRET_KEY=some-secret-you-pick
 
-# 4. Preflight the backend before pointing production traffic at it.
+# 4. Preflight the backend, then run.
 s3armor check --bucket my-bucket
-
-# 5. Run.
 s3armor serve
 ```
 
-Prefer a config file over exporting variables? See
-[`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) for the full `config.toml`
-reference, every `S3A_*` variable, TLS, metrics, and rate limiting.
+Now point your S3 client at s3armor instead of the bucket. The
+[user guide](docs/USER-GUIDE.md) covers `config.toml`, every `S3A_*`
+variable, TLS, metrics and rate limiting.
 
-## Back up the master key
+## The master key is the data
 
-The master key is the data. If you lose it, encrypted objects are noise —
-the storage provider cannot help you. Store the key in a password manager
-before you store a single object.
+Lose the key and every stored object is noise. The storage provider
+cannot help. Put the key in a password manager before you store the
+first object.
 
 ## Documentation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design and how it works.
-- [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) — install, configure, operate.
-- [`docs/DEVELOPER-GUIDE.md`](docs/DEVELOPER-GUIDE.md) — build, test, contribute.
-
-Contributing: run `pre-commit install --install-hooks` once per clone —
-see [`docs/DEVELOPER-GUIDE.md`](docs/DEVELOPER-GUIDE.md) for the full
-contributor guide.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): design, threat model,
+  and what the proxy does not protect against.
+- [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md): install, configure, operate.
+- [`docs/DEVELOPER-GUIDE.md`](docs/DEVELOPER-GUIDE.md): build, test,
+  contribute. Run `pre-commit install --install-hooks` once per clone.
 
 ## License
 
