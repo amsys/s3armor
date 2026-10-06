@@ -1,14 +1,19 @@
-# Dependabot checks cargo dependencies each week and opens update PRs.
+# Dependabot checks cargo dependencies each week but opens no PRs.
+# A limit of 0 turns version-update PRs off. Security alerts are not
+# affected: they stay visible in the Security tab and in notifications.
+# Dependency bumps are done by hand (`cargo update`). Set the limit back
+# to 5 to get PRs again.
 version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     # These crates must move to digest 0.11 together with rsa. rsa 0.9
     # uses digest 0.10. Our OAEP key wrap uses Sha256 through it. Remove
-    # this ignore when rsa 0.10 is stable.
+    # this ignore when rsa 0.10 is stable. The list stays while PRs are
+    # off: it names the crates a manual bump must leave alone.
     ignore:
       - dependency-name: "sha2"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
