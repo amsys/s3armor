@@ -145,7 +145,7 @@ fn handle_start_event(
     key: &mut Option<String>,
 ) {
     current_tag.clear();
-    current_tag.extend_from_slice(e.name().as_ref());
+    current_tag.extend_from_slice(e.name().as_ref().as_bytes());
     if current_tag == b"Contents" {
         *in_contents = true;
         *key = None;
@@ -160,7 +160,7 @@ fn handle_end_event(
     key: &mut Option<String>,
     objects: &mut Vec<ListedObject>,
 ) {
-    if e.name().as_ref() == b"Contents" {
+    if e.name().as_ref() == "Contents" {
         *in_contents = false;
         if let Some(k) = key.take() {
             objects.push(ListedObject { key: k });
@@ -185,8 +185,7 @@ fn check_truncation_state(
 
 /// Decodes and unescapes an XML text event's raw bytes.
 fn event_text(t: &quick_xml::events::BytesText<'_>) -> Result<String, ToolError> {
-    let decoded = t.decode().map_err(|e| ToolError::Xml(e.to_string()))?;
-    Ok(quick_xml::escape::unescape(&decoded)
+    Ok(quick_xml::escape::unescape(t)
         .map_err(|e| ToolError::Xml(e.to_string()))?
         .into_owned())
 }

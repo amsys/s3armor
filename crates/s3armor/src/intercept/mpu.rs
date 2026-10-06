@@ -836,10 +836,9 @@ pub(crate) fn parse_single_tag(xml: &[u8], tag: &[u8]) -> Option<String> {
     let mut current: Vec<u8> = Vec::new();
     loop {
         match reader.read_event().ok()? {
-            Event::Start(e) => current = e.name().as_ref().to_vec(),
+            Event::Start(e) => current = e.name().as_ref().as_bytes().to_vec(),
             Event::Text(t) if current == tag => {
-                let decoded = t.decode().ok()?;
-                return quick_xml::escape::unescape(&decoded)
+                return quick_xml::escape::unescape(&t)
                     .ok()
                     .map(std::borrow::Cow::into_owned);
             }
@@ -881,7 +880,7 @@ fn parse_complete_xml(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
             S3Error::bad_gateway(format!("invalid CompleteMultipartUpload XML: {e}"))
         })? {
             Event::Start(e) => {
-                current = e.name().as_ref().to_vec();
+                current = e.name().as_ref().as_bytes().to_vec();
                 if current == b"Part" {
                     number = None;
                     etag = None;
@@ -891,7 +890,7 @@ fn parse_complete_xml(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
                 assign_part_field(&current, event_text(&t)?, &mut number, &mut etag);
             }
             Event::End(e) => {
-                if e.name().as_ref() == b"Part" {
+                if e.name().as_ref() == "Part" {
                     if let (Some(n), Some(t)) = (number.take(), etag.take()) {
                         parts.push((n, t));
                     }
@@ -906,10 +905,7 @@ fn parse_complete_xml(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
 
 /// Decodes and unescapes an XML text event's raw bytes.
 fn event_text(t: &quick_xml::events::BytesText<'_>) -> Result<String, S3Error> {
-    let decoded = t
-        .decode()
-        .map_err(|e| S3Error::bad_gateway(e.to_string()))?;
-    Ok(quick_xml::escape::unescape(&decoded)
+    Ok(quick_xml::escape::unescape(t)
         .map_err(|e| S3Error::bad_gateway(e.to_string()))?
         .into_owned())
 }

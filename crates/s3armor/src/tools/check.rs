@@ -816,10 +816,10 @@ fn has_enabled_abort_rule(body: &[u8]) -> bool {
     let mut scan = RuleScan::default();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) => scan.start(e.name().as_ref()),
-            Ok(Event::Text(t)) => scan.text(&t.decode().unwrap_or_default()),
+            Ok(Event::Start(e)) => scan.start(e.name().as_ref().as_bytes()),
+            Ok(Event::Text(t)) => scan.text(&t),
             Ok(Event::End(e)) => {
-                if scan.end(e.name().as_ref()) {
+                if scan.end(e.name().as_ref().as_bytes()) {
                     return true;
                 }
             }
