@@ -29,7 +29,7 @@
 
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -44,11 +44,11 @@ services:
       retries: 12
 
   createbuckets:
-    # Same image as the `minio` service above, not a separate `minio/mc`
-    # pull: MinIO Inc. restricted several Docker Hub repos (mc included),
-    # so every MinIO image in this repo comes from quay.io. The `minio`
-    # image bundles the `mc` binary this entrypoint calls.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # Same image as the `minio` service above, not a separate `mc` image.
+    # MinIO Inc. stopped anonymous pulls on quay.io and Docker Hub, so every
+    # MinIO image in this repo comes from the community fork `pgsty/minio`.
+    # That image bundles the `mc` binary this entrypoint calls.
+    image: docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     depends_on:
       minio:
         condition: service_healthy

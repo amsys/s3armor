@@ -30,7 +30,7 @@ ignore = [
     "RUSTSEC-2026-0104",
     # RUSTSEC-2025-0111: `tokio-tar` (archived, no patched release) mis-
     # parses PAX headers in `testcontainers`' image-loading path. We only
-    # pull known-good, official images (`minio/minio`) by tag, never
+    # pull known images (`pgsty/minio`) by a pinned tag, never
     # untrusted tarballs. Upgrade path: `testcontainers` switching to
     # `astral-tokio-tar` or an equivalent maintained fork.
     "RUSTSEC-2025-0111",

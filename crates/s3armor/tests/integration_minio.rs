@@ -184,7 +184,7 @@ async fn setup_with(
     String,
     testcontainers::ContainerAsync<GenericImage>,
 ) {
-    let minio = GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+    let minio = GenericImage::new("docker.io/pgsty/minio", "RELEASE.2026-08-04T00-00-00Z")
         .with_exposed_port(9000.tcp())
         .with_wait_for(WaitFor::message_on_stderr("API:"))
         .with_env_var("MINIO_ROOT_USER", "minioadmin")

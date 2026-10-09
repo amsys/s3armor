@@ -150,7 +150,7 @@ mkdir -p "$WORKDIR/candidates"
 # forks; -1 asks for no limit and is a no-op where the default already
 # allows it.
 CIPHERTEXT_CHECK="$(docker run --rm --pids-limit=-1 --network "s3a-e2e-check_default" -v "$WORKDIR/candidates:/out" \
-  --entrypoint sh quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z -c "
+  --entrypoint sh docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z -c "
   set -e
   mc alias set m http://minio:9000 minioadmin '$BACKEND_SECRET' >/dev/null
   found=0
