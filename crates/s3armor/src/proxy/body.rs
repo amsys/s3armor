@@ -608,17 +608,21 @@ async fn push_range_frame(
     tx.send(Ok(Frame::data(Bytes::from(pt)))).await.is_ok()
 }
 
-/// Finalises a `decrypting_range` stream at EOF: takes the last chunk from
-/// `dec`, trims it to the exact requested window, and sends it. `trim_end`
-/// is an offset within this final chunk; `to_drop` is any leading trim
-/// still pending (a range that covers a single chunk).
+/// Finishes one ranged decrypt: takes the last chunk from `dec`, trims it
+/// to the exact requested window, and sends it. `trim_end` is an offset
+/// within this final chunk. `to_drop` is any leading trim that is still
+/// pending (a range that covers a single chunk). `decrypting_range` calls
+/// this once at EOF. `decrypting_multipart_range` calls it once for each
+/// plan entry, when the full ciphertext of that entry has arrived. Returns
+/// `false` to stop the caller: a verify failure (its `Err` frame is
+/// already sent) or a gone receiver.
 async fn finish_range(
     dec: Decryptor,
     to_drop: usize,
     trim_end: usize,
     tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
     on_verify_failure: Option<&Arc<AtomicU64>>,
-) {
+) -> bool {
     match dec.finish() {
         Ok(mut pt) => {
             pt.truncate(trim_end);
@@ -627,13 +631,12 @@ async fn finish_range(
             } else {
                 pt.clear();
             }
-            if !pt.is_empty() {
-                let _ = tx.send(Ok(Frame::data(Bytes::from(pt)))).await;
-            }
+            pt.is_empty() || tx.send(Ok(Frame::data(Bytes::from(pt)))).await.is_ok()
         }
         Err(e) => {
             note_chunk_verify_failure(on_verify_failure);
             let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
+            false
         }
     }
 }
@@ -734,7 +737,7 @@ impl MultipartCursor {
         on_verify_failure: Option<&Arc<AtomicU64>>,
     ) -> bool {
         while !data.is_empty() {
-            let piece = take_for_span(&mut data, &self.span, self.consumed_ct);
+            let piece = take_up_to(&mut data, self.span.ct_len - self.consumed_ct);
             self.consumed_ct += piece.len() as u64;
             if !emit_decrypt_result(self.dec.push(&piece), tx, on_verify_failure).await {
                 return false;
@@ -771,15 +774,15 @@ impl MultipartCursor {
     }
 }
 
-/// Splits off the front of `data` for the current span, bounded by how much
-/// of that span's ciphertext is still unconsumed — the piece a single
-/// `Decryptor::push` should see next.
+/// Splits off the front of `data`, at most `remaining` bytes. `remaining`
+/// is the ciphertext that the current part (`MultipartCursor`) or the
+/// current plan entry (`RangeCursor`) still owns. The result is the piece
+/// that the next `Decryptor::push` gets.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "take = min(data.len(), remaining) as usize is bounded by data.len(), an already-usize value"
 )]
-fn take_for_span(data: &mut Bytes, span: &PartSpan, consumed_ct: u64) -> Bytes {
-    let remaining = span.ct_len - consumed_ct;
+fn take_up_to(data: &mut Bytes, remaining: u64) -> Bytes {
     let take = (data.len() as u64).min(remaining) as usize;
     data.split_to(take)
 }
@@ -802,165 +805,212 @@ async fn emit_decrypt_result(
     }
 }
 
-/// Decrypts a ciphertext byte range spanning one or more parts of a
+/// Decrypts a ciphertext byte range that spans one or more parts of a
 /// multipart v1 object. `plan` is
-/// [`s3armor_format::v1::plan_multipart_range`]'s output; the caller has
-/// already issued one backend ranged GET covering exactly the concatenation
-/// of each entry's local `[ct_start, ct_end)` (contiguous by construction —
-/// see `plan_multipart_range`'s doc comment) so `inner` yields precisely
-/// that span, in part order, no more.
+/// [`s3armor_format::v1::plan_multipart_range`]'s output. The caller sends
+/// one backend ranged GET that covers the local `[ct_start, ct_end)` of
+/// each entry, in part order. These spans are contiguous (see the doc
+/// comment of `plan_multipart_range`). So `inner` gives exactly that
+/// ciphertext, and each entry owns exactly `ct_end - ct_start` bytes of it.
 ///
-/// # ponytail
-/// Buffers the covered ciphertext span (`buf`) before decrypting it, but
-/// emits each part's trimmed plaintext as it is produced rather than
-/// accumulating the whole output. A whole-object range never reaches here:
-/// the caller routes a range that covers the entire object to the full
-/// streaming path (`intercept::get`), so `plan` is always a bounded,
-/// client-requested window. A send that fails because the client
-/// disconnected stops the task.
-pub fn decrypting_multipart_range(
-    mut inner: Incoming,
+/// `handle_ranged` in `intercept::get` sends every satisfiable range of a
+/// multipart object here, also a whole-object range such as `bytes=0-`.
+/// Thus this function streams. It walks the entries with a [`RangeCursor`]
+/// and keeps memory at O(chunk): the decryptor holds at most one frame plus
+/// one incoming frame, and the channel holds at most 4 frames. The object
+/// size and the part size do not change this. Each chunk is verified
+/// before its plaintext leaves the task.
+///
+/// The task stops when the client is gone, also while the backend sends
+/// nothing: it checks `tx.closed()` before each read. After the last
+/// entry, the task reads the backend one more time. An EOF on that read
+/// lets hyper put the backend connection back in its pool. Data on that
+/// read means that the backend sent more than the plan asked for: the task
+/// stops and drops `inner`, which closes that connection. The task ignores
+/// a transport error on that read, because it verified and sent all
+/// requested bytes before.
+///
+/// The `Err`-frame protocol is the same as in the other decrypt paths. A
+/// verify failure increments `on_verify_failure` and ends the stream with
+/// an `Err` frame. A transport error or an EOF before the last entry is
+/// complete also ends the stream with an `Err` frame, but does not change
+/// the counter: a body that stops early is not a tamper.
+pub fn decrypting_multipart_range<B>(
+    mut inner: B,
     alg: Alg,
     dek: [u8; 32],
     chunk_size: usize,
     plan: Vec<(PartSpan, RangePlan)>,
     on_verify_failure: Option<Arc<AtomicU64>>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send,
+{
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
     tokio::spawn(async move {
-        let Some(buf) = collect_multipart_range_body(&mut inner, &tx).await else {
-            return;
+        let Some(mut cursor) = RangeCursor::new(alg, dek, chunk_size, plan) else {
+            return; // an empty plan: the caller answers an empty 206 itself
         };
-        let mut offset = 0usize;
-        let n = plan.len();
-        for (i, (span, range_plan)) in plan.iter().enumerate() {
-            if !decrypt_range_part(
-                &buf,
-                &mut offset,
-                i,
-                n,
-                span,
-                range_plan,
-                alg,
-                dek,
-                chunk_size,
-                &tx,
-                on_verify_failure.as_ref(),
-            )
-            .await
-            {
-                return;
+        loop {
+            // `biased`: when the client is gone, stop before the task
+            // decrypts one more frame. `frame()` only polls the body, so a
+            // dropped `frame()` future loses no bytes.
+            let next = tokio::select! {
+                biased;
+                () = tx.closed() => return,
+                next = inner.frame() => next,
+            };
+            match next {
+                Some(Ok(frame)) => {
+                    let Ok(data) = frame.into_data() else {
+                        continue; // a trailers frame; ignore
+                    };
+                    if cursor.is_done() {
+                        // The backend sent more than the plan asked for.
+                        // All requested bytes are already out. Dropping
+                        // `inner` closes that connection. Never drain a
+                        // body that has no limit.
+                        return;
+                    }
+                    if !cursor.feed(data, &tx, on_verify_failure.as_ref()).await {
+                        return;
+                    }
+                }
+                Some(Err(e)) => {
+                    if !cursor.is_done() {
+                        let _ = tx.send(Err(io_err(e))).await;
+                    }
+                    return;
+                }
+                None => {
+                    if !cursor.is_done() {
+                        let _ = tx
+                            .send(Err(io_err("multipart ranged read ended before its span")))
+                            .await;
+                    }
+                    return;
+                }
             }
         }
     });
     StreamBody::new(ReceiverStream(rx)).boxed()
 }
 
-/// Reads `inner` to completion into one buffer. The caller has already
-/// issued a backend ranged GET covering exactly the requested span
-/// (`decrypting_multipart_range`'s doc comment), so a clean EOF is the
-/// normal end. `None` on a transport error (its `Err` frame is already
-/// sent) — the caller has nothing left to do.
-async fn collect_multipart_range_body(
-    inner: &mut Incoming,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
-) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    loop {
-        match inner.frame().await {
-            Some(Ok(frame)) => {
-                let Ok(data) = frame.into_data() else {
-                    continue;
-                };
-                buf.extend_from_slice(&data);
-            }
-            Some(Err(e)) => {
-                let _ = tx.send(Err(io_err(e))).await;
-                return None;
-            }
-            None => return Some(buf),
-        }
-    }
-}
-
-/// Decrypts part `i` of `n` (its ciphertext already sliced out of `buf` at
-/// `offset`, advancing `offset` past it) and forwards its trimmed plaintext.
-/// Returns `false` to stop the caller: a short buffer, a verify failure (its
-/// `Err` frame is already sent), or a gone receiver.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one per-part decrypt-and-trim step: alg/dek/chunk_size describe the cipher, i/n/span/range_plan/offset locate this part's slice — splitting would fragment a single auditable step"
-)]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "span/chunk sizes are config-bounded well under usize::MAX on every supported (64-bit) target"
-)]
-async fn decrypt_range_part(
-    buf: &[u8],
-    offset: &mut usize,
-    i: usize,
-    n: usize,
-    span: &PartSpan,
-    range_plan: &RangePlan,
+/// The cursor that `decrypting_multipart_range` walks. It holds the
+/// `Decryptor` of the current plan entry, the ciphertext that this entry
+/// still owns, and the trims of this entry.
+///
+/// Each entry uses its own `trim_start` and `trim_end`.
+/// `plan_multipart_range` sets `trim_start` to 0 for each entry after the
+/// first entry. It sets `trim_end` to the real length of the last chunk
+/// for each entry before the last entry. Thus the result is the same as
+/// "`trim_start` only on the first entry, `trim_end` only on the last
+/// entry", and the cursor needs no entry index.
+struct RangeCursor {
     alg: Alg,
     dek: [u8; 32],
     chunk_size: usize,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
-    on_verify_failure: Option<&Arc<AtomicU64>>,
-) -> bool {
-    let span_len = (range_plan.ct_end - range_plan.ct_start) as usize;
-    let Some(slice) = buf.get(*offset..*offset + span_len) else {
-        let _ = tx
-            .send(Err(io_err("multipart ranged read ended before its span")))
-            .await;
-        return false;
-    };
-    *offset += span_len;
-    let total_chunks = n_chunks(span.pt_len, chunk_size as u64);
-    let final_frame_is_part_end = range_plan.last_chunk + 1 == total_chunks;
-    let mut dec = Decryptor::new_at(
-        alg,
-        dek,
-        span.number,
-        chunk_size,
-        range_plan.first_chunk,
-        final_frame_is_part_end,
-    );
-    let mut decrypted = match dec.push(slice) {
-        Ok(pt) => pt,
-        Err(e) => {
-            note_chunk_verify_failure(on_verify_failure);
-            let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
-            return false;
-        }
-    };
-    match dec.finish() {
-        Ok(pt) => decrypted.extend(pt),
-        Err(e) => {
-            note_chunk_verify_failure(on_verify_failure);
-            let _ = tx.send(Err(io_err(decrypt_error_message(&e)))).await;
-            return false;
-        }
+    entries: std::vec::IntoIter<(PartSpan, RangePlan)>,
+    /// The decryptor of the current entry. `None` when every entry is
+    /// finished, or after `feed` returned `false`.
+    dec: Option<Decryptor>,
+    /// The ciphertext bytes that the current entry still owns.
+    remaining: u64,
+    /// The leading plaintext bytes of the current entry that the cursor
+    /// must still skip. `push_range_frame` decreases it.
+    to_drop: usize,
+    /// The end offset in the final chunk of the current entry.
+    /// `finish_range` uses it.
+    trim_end: usize,
+}
+
+impl RangeCursor {
+    /// `None` for an empty plan: there is nothing to decrypt.
+    fn new(
+        alg: Alg,
+        dek: [u8; 32],
+        chunk_size: usize,
+        plan: Vec<(PartSpan, RangePlan)>,
+    ) -> Option<Self> {
+        let mut entries = plan.into_iter();
+        let (span, range_plan) = entries.next()?;
+        let mut cursor = Self {
+            alg,
+            dek,
+            chunk_size,
+            entries,
+            dec: None,
+            remaining: 0,
+            to_drop: 0,
+            trim_end: 0,
+        };
+        cursor.start(&span, &range_plan);
+        Some(cursor)
     }
-    let last_chunk_pt_len =
-        decrypted.len() - (range_plan.last_chunk - range_plan.first_chunk) as usize * chunk_size;
-    let start = if i == 0 { range_plan.trim_start } else { 0 };
-    let end = if i + 1 == n {
-        (decrypted.len() - last_chunk_pt_len + range_plan.trim_end).min(decrypted.len())
-    } else {
-        decrypted.len()
-    };
-    // Emit this part's trimmed slice now instead of accumulating the whole
-    // output. A gone receiver stops the caller.
-    let Some(piece) = decrypted.get(start..end) else {
-        return true;
-    };
-    if piece.is_empty() {
-        return true;
+
+    /// Makes `span` and `range_plan` the current entry.
+    fn start(&mut self, span: &PartSpan, range_plan: &RangePlan) {
+        // The encryptor sealed the final frame of this entry with
+        // `last = true` only when that frame is the final chunk of the part.
+        let final_frame_is_part_end =
+            range_plan.last_chunk + 1 == n_chunks(span.pt_len, self.chunk_size as u64);
+        self.dec = Some(Decryptor::new_at(
+            self.alg,
+            self.dek,
+            span.number,
+            self.chunk_size,
+            range_plan.first_chunk,
+            final_frame_is_part_end,
+        ));
+        self.remaining = range_plan.ct_end - range_plan.ct_start;
+        self.to_drop = range_plan.trim_start;
+        self.trim_end = range_plan.trim_end;
     }
-    tx.send(Ok(Frame::data(Bytes::copy_from_slice(piece))))
-        .await
-        .is_ok()
+
+    /// Feeds one inbound frame to the decryptor of the current entry. When
+    /// an entry has all of its ciphertext, the cursor finishes it and
+    /// starts the next entry. One frame can hold the end of one entry and
+    /// the start of the next entry. The cursor ignores the bytes of a frame
+    /// that come after the last entry. Returns `false` to stop the caller:
+    /// a verify failure (its `Err` frame is already sent) or a gone
+    /// receiver. Do not use the cursor again after `false`.
+    async fn feed(
+        &mut self,
+        mut data: Bytes,
+        tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+        on_verify_failure: Option<&Arc<AtomicU64>>,
+    ) -> bool {
+        while !data.is_empty() {
+            let Some(mut dec) = self.dec.take() else {
+                break; // every entry is finished
+            };
+            let piece = take_up_to(&mut data, self.remaining);
+            self.remaining -= piece.len() as u64;
+            if !push_range_frame(&mut dec, &piece, &mut self.to_drop, tx, on_verify_failure).await {
+                return false;
+            }
+            if self.remaining > 0 {
+                self.dec = Some(dec);
+                continue;
+            }
+            // The cursor calls `finish_range` only when `dec` has the full
+            // ciphertext of the entry. Thus a body that stops early never
+            // shows as a verify failure.
+            if !finish_range(dec, self.to_drop, self.trim_end, tx, on_verify_failure).await {
+                return false;
+            }
+            if let Some((span, range_plan)) = self.entries.next() {
+                self.start(&span, &range_plan);
+            }
+        }
+        true
+    }
+
+    /// True when every entry is finished.
+    const fn is_done(&self) -> bool {
+        self.dec.is_none()
+    }
 }
 
 /// Increments `counter`, when given one — `docs/ARCHITECTURE.md`
@@ -997,8 +1047,17 @@ impl<T> futures_util::Stream for ReceiverStream<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
     use futures_util::stream;
-    use s3armor_format::v1::{decrypt_all, encrypt_all, part_layout, plan_range};
+    use s3armor_format::v1::{
+        decrypt_all, encrypt_all, part_layout, plan_multipart_range, plan_range,
+    };
 
     use super::*;
     use crate::chunked::ChunkVerifier;
@@ -1423,5 +1482,316 @@ mod tests {
 
         assert!(res.is_err());
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    // ---- Ranged reads on a multipart object (`decrypting_multipart_range`) ----
+
+    /// Both ciphers. Their frame overheads differ (28 and 40 bytes).
+    const ALGS: [Alg; 2] = [Alg::Aes256Gcm, Alg::XChaCha20Poly1305];
+
+    /// Part number and plaintext length of the three parts that most
+    /// ranged-read tests use. The part numbers skip 3 and 4 on purpose.
+    const SMALL_PARTS: [(u32, usize); 3] = [(1, 40), (2, 32), (5, 50)];
+
+    /// The size of each body frame in the tests that feed small frames. It
+    /// is smaller than one cipher frame, so most cipher frames arrive in
+    /// pieces.
+    const SMALL_FRAME: usize = 7;
+
+    /// A multipart object for the ranged-read tests. It holds the plaintext,
+    /// the ciphertext of each part, and the part layout.
+    struct RangeObject {
+        alg: Alg,
+        plaintext: Vec<u8>,
+        part_cts: Vec<Vec<u8>>,
+        spans: Vec<PartSpan>,
+    }
+
+    impl RangeObject {
+        /// `parts` lists the part number and plaintext length of each part.
+        /// The plaintext bytes change from place to place, so a wrong slice
+        /// shows up as a wrong byte.
+        fn new(alg: Alg, parts: &[(u32, usize)]) -> Self {
+            let total: usize = parts.iter().map(|&(_, len)| len).sum();
+            let plaintext: Vec<u8> = (0..total)
+                .map(|i| u8::try_from((i * 31 + 7) % 251).unwrap())
+                .collect();
+            let mut offset = 0;
+            let mut part_cts = Vec::new();
+            for &(number, len) in parts {
+                let part = &plaintext[offset..offset + len];
+                part_cts.push(encrypt_all(alg, &KEY, number, CHUNK, part));
+                offset += len;
+            }
+            let layout: Vec<(u32, u64)> = parts.iter().map(|&(n, len)| (n, len as u64)).collect();
+            let spans = part_layout(alg, CHUNK as u64, &layout);
+            Self {
+                alg,
+                plaintext,
+                part_cts,
+                spans,
+            }
+        }
+
+        fn plan(&self, start: usize, end: usize) -> Vec<(PartSpan, RangePlan)> {
+            plan_multipart_range(
+                &self.spans,
+                self.alg,
+                CHUNK as u64,
+                start as u64,
+                end as u64,
+            )
+            .unwrap()
+        }
+
+        /// The ciphertext bytes the backend serves for `plan`. The bounds
+        /// use the same arithmetic as `handle_ranged` in `intercept/get.rs`.
+        fn window(&self, plan: &[(PartSpan, RangePlan)]) -> Vec<u8> {
+            let (first_span, first) = plan.first().unwrap();
+            let (last_span, last) = plan.last().unwrap();
+            let from = usize::try_from(first_span.ct_start + first.ct_start).unwrap();
+            let to = usize::try_from(last_span.ct_start + last.ct_end).unwrap();
+            self.part_cts.concat()[from..to].to_vec()
+        }
+
+        /// Reads `[start, end)` through `decrypting_multipart_range` and
+        /// checks it against the same slice of the plaintext.
+        async fn assert_slice(&self, start: usize, end: usize) {
+            let plan = self.plan(start, end);
+            let window = self.window(&plan);
+            let body = body_from_frames(split_frames(&window, SMALL_FRAME));
+            let out = collect_ok(decrypting_multipart_range(
+                body, self.alg, KEY, CHUNK, plan, None,
+            ))
+            .await;
+            assert_eq!(
+                out,
+                &self.plaintext[start..end],
+                "alg {:?} range {start}..{end}",
+                self.alg
+            );
+        }
+    }
+
+    fn split_frames(data: &[u8], frame_len: usize) -> Vec<Vec<u8>> {
+        data.chunks(frame_len).map(<[u8]>::to_vec).collect()
+    }
+
+    /// Gives a spawned task time to run when the test thread has no other
+    /// work: 64 yields, then a short sleep.
+    async fn let_tasks_run() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// A body that counts the frames the reader pulls from it. It returns
+    /// `None` once every frame is out.
+    struct CountingBody {
+        frames: VecDeque<Bytes>,
+        pulled: Arc<AtomicUsize>,
+    }
+
+    impl http_body::Body for CountingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            let next = self.frames.pop_front();
+            if next.is_some() {
+                self.pulled.fetch_add(1, Ordering::SeqCst);
+            }
+            Poll::Ready(next.map(|data| Ok(Frame::data(data))))
+        }
+    }
+
+    /// A body that never yields a frame and never wakes its reader. It
+    /// records when the reader drops it.
+    struct NeverBody {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl http_body::Body for NeverBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for NeverBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_range_pulls_only_a_few_frames_without_a_reader() {
+        // Part plaintext lengths 128, 136 and 128: eight full chunks, eight
+        // full plus one short, eight full.
+        let parts = [(1u32, 128usize), (2, 136), (3, 128)];
+        for alg in ALGS {
+            let obj = RangeObject::new(alg, &parts);
+            // One body frame for each cipher frame. Each part ends on its
+            // own frame boundary.
+            let frames: VecDeque<Bytes> = obj
+                .part_cts
+                .iter()
+                .flat_map(|ct| ct.chunks(CHUNK + alg.overhead()))
+                .map(Bytes::copy_from_slice)
+                .collect();
+            let total_frames = frames.len();
+            let pulled = Arc::new(AtomicUsize::new(0));
+            let backend = CountingBody {
+                frames,
+                pulled: pulled.clone(),
+            };
+            let plan = obj.plan(0, obj.plaintext.len());
+            // Keep the body alive and never read it.
+            let body = decrypting_multipart_range(backend, alg, KEY, CHUNK, plan, None);
+            let_tasks_run().await;
+            let pulled_now = pulled.load(Ordering::SeqCst);
+            // The exact count is 6: four frames wait in the channel, one is
+            // blocked in `send`, and one is held back by `Decryptor::push`.
+            assert!(
+                pulled_now >= 4,
+                "alg {alg:?}: pulled {pulled_now} of {total_frames}"
+            );
+            assert!(
+                pulled_now <= 8,
+                "alg {alg:?}: pulled {pulled_now} of {total_frames}"
+            );
+            assert!(
+                pulled_now < total_frames,
+                "alg {alg:?}: pulled {pulled_now} of {total_frames}"
+            );
+            drop(body);
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_range_matches_plaintext_slices() {
+        // Ranges that touch a chunk edge, a part edge, both ends of the
+        // object, and the short last chunk.
+        const NAMED: [(usize, usize); 10] = [
+            (3, 9),     // inside one chunk
+            (10, 20),   // across a chunk boundary
+            (35, 45),   // across the part boundary at 40
+            (40, 72),   // exactly one whole part
+            (20, 40),   // ends exactly at a part boundary
+            (100, 122), // open-ended: `bytes=100-`
+            (0, 122),   // the whole object
+            (121, 122), // the last byte
+            (120, 121), // inside the short last chunk of the last part
+            (30, 100),  // through all three parts
+        ];
+        for alg in ALGS {
+            let obj = RangeObject::new(alg, &SMALL_PARTS);
+            let total = obj.plaintext.len();
+            assert_eq!(total, 122);
+            for (start, end) in NAMED {
+                obj.assert_slice(start, end).await;
+            }
+            for start in 0..total {
+                for end in [start + 1, (start + 17).min(total), total] {
+                    obj.assert_slice(start, end).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_range_tamper_in_second_part_ends_with_err() {
+        for alg in ALGS {
+            let obj = RangeObject::new(alg, &SMALL_PARTS);
+            let plan = obj.plan(0, obj.plaintext.len());
+            let mut window = obj.window(&plan);
+            // The window starts at byte 0 of part 1. Flip the first
+            // ciphertext byte after the nonce in the first frame of part 2.
+            let part2_start = usize::try_from(obj.spans[1].ct_start).unwrap();
+            window[part2_start + alg.nonce_len()] ^= 0xFF;
+
+            let counter = Arc::new(AtomicU64::new(0));
+            let body = body_from_frames(split_frames(&window, SMALL_FRAME));
+            let mut out =
+                decrypting_multipart_range(body, alg, KEY, CHUNK, plan, Some(counter.clone()));
+            let mut got = Vec::new();
+            let mut failure = None;
+            while let Some(frame) = out.frame().await {
+                match frame {
+                    Ok(frame) => {
+                        if let Ok(data) = frame.into_data() {
+                            got.extend_from_slice(&data);
+                        }
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            let failure = failure.expect("a tampered part must end the stream with an Err");
+            assert!(
+                failure.to_string().contains("v1 decrypt failed"),
+                "alg {alg:?}: {failure}"
+            );
+            // All of part 1 comes out. Nothing of part 2 comes out.
+            assert_eq!(got, &obj.plaintext[..40], "alg {alg:?}");
+            assert_eq!(counter.load(Ordering::SeqCst), 1, "alg {alg:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_range_ends_before_its_span() {
+        for alg in ALGS {
+            let obj = RangeObject::new(alg, &SMALL_PARTS);
+            let plan = obj.plan(0, obj.plaintext.len());
+            let window = obj.window(&plan);
+            let half = &window[..window.len().div_ceil(2)];
+
+            let counter = Arc::new(AtomicU64::new(0));
+            let body = body_from_frames(split_frames(half, SMALL_FRAME));
+            let res =
+                decrypting_multipart_range(body, alg, KEY, CHUNK, plan, Some(counter.clone()))
+                    .collect()
+                    .await;
+            let Err(failure) = res else {
+                panic!("alg {alg:?}: a short backend body must end in an Err");
+            };
+            assert!(
+                failure.to_string().contains("ended before its span"),
+                "alg {alg:?}: {failure}"
+            );
+            // A cut-off body is not a tamper. The counter stays at 0.
+            assert_eq!(counter.load(Ordering::SeqCst), 0, "alg {alg:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_range_releases_the_backend_when_the_client_is_gone() {
+        for alg in ALGS {
+            let obj = RangeObject::new(alg, &SMALL_PARTS);
+            let plan = obj.plan(0, obj.plaintext.len());
+            let dropped = Arc::new(AtomicBool::new(false));
+            let backend = NeverBody {
+                dropped: dropped.clone(),
+            };
+            let body = decrypting_multipart_range(backend, alg, KEY, CHUNK, plan, None);
+            // The client leaves while the backend is silent.
+            drop(body);
+            let_tasks_run().await;
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "alg {alg:?}: the task still holds the backend body"
+            );
+        }
     }
 }
