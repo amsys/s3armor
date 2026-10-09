@@ -13,21 +13,11 @@ ignore = [
     # RSA support, if this crate's fix never lands.
     "RUSTSEC-2023-0071",
 
-    # All four below are dev-dependency-only, pulled in by testing
-    # infrastructure (aws-config's own internal HTTP client for STS/SSO
-    # calls we never make; testcontainers' image-tarball extraction), and
-    # never reach the shipped binary. `cargo tree` confirms every path is
-    # `(dev) s3armor -> ...`.
+    # Both below are dev-dependency-only, pulled in by testing
+    # infrastructure (testcontainers' image-tarball extraction and its
+    # Docker client), and never reach the shipped binary. `cargo tree`
+    # confirms every path is `(dev) s3armor -> ...`.
     #
-    # RUSTSEC-2026-0098/0099/0104: certificate name-constraint and CRL
-    # parsing bugs in `rustls-webpki` 0.101.7, pulled by the now-outdated
-    # `hyper-rustls` 0.24.2 -> `rustls` 0.21.12 chain inside `aws-config`'s
-    # `aws-smithy-http-client`. Our own client (`proxy/client.rs`) pins
-    # `hyper-rustls` 0.27 / `rustls-webpki` 0.103 directly — unaffected.
-    # Upgrade path: track `aws-config` picking up a newer smithy runtime.
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
     # RUSTSEC-2025-0111: `tokio-tar` (archived, no patched release) mis-
     # parses PAX headers in `testcontainers`' image-loading path. We only
     # pull known images (`pgsty/minio`) by a pinned tag, never
@@ -42,11 +32,6 @@ ignore = [
     # `testcontainers` -> `bollard` remains). No safe upgrade exists yet
     # upstream. Upgrade path: `bollard` moving to `PemObject` too.
     "RUSTSEC-2025-0134",
-    # RUSTSEC-2026-0258: unbounded empty DATA frames in `h2` 0.3.27, pulled
-    # by `aws-config`'s smithy HTTP client via the old `hyper` 0.14 stack —
-    # dev-only. Our own runtime stack (`proxy/client.rs`) is on `hyper` 1.x
-    # with `h2` 0.4.16, already patched; both versions coexist in the tree.
-    "RUSTSEC-2026-0258",
 
     # The optional, off-by-default `pprof` feature (flamegraph
     # profiling, never in the release image) pulls `inferno` -> an old
