@@ -294,6 +294,6 @@ mod tests {
     fn missing_header_is_a_no_op() {
         let mut headers: Vec<(String, String)> = vec![];
         translate_copy_source_conditionals(&mut headers, "\"a\"", "\"b\"");
-        assert!(headers.is_empty());
+        assert_eq!(headers, Vec::<(String, String)>::new());
     }
 }

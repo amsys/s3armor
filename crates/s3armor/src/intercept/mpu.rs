@@ -984,7 +984,10 @@ mod tests {
     #[test]
     fn empty_complete_body_yields_no_parts() {
         let xml = b"<CompleteMultipartUpload></CompleteMultipartUpload>";
-        assert!(unwrap_parts(parse_complete_xml(xml)).is_empty());
+        assert_eq!(
+            unwrap_parts(parse_complete_xml(xml)),
+            Vec::<(u32, String)>::new()
+        );
     }
 
     #[test]

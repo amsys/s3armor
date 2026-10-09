@@ -160,7 +160,7 @@ mod tests {
     fn if_none_match_hit_is_not_modified() {
         let mut headers = vec![("if-none-match".to_string(), "\"abc\"".to_string())];
         let conds = Conditionals::take(&mut headers);
-        assert!(headers.is_empty());
+        assert_eq!(headers, Vec::<(String, String)>::new());
         assert_eq!(conds.evaluate("\"abc\""), Precondition::NotModified);
     }
 
