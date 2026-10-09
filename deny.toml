@@ -13,26 +13,6 @@ ignore = [
     # RSA support, if this crate's fix never lands.
     "RUSTSEC-2023-0071",
 
-    # Both below are dev-dependency-only, pulled in by testing
-    # infrastructure (testcontainers' image-tarball extraction and its
-    # Docker client), and never reach the shipped binary. `cargo tree`
-    # confirms every path is `(dev) s3armor -> ...`.
-    #
-    # RUSTSEC-2025-0111: `tokio-tar` (archived, no patched release) mis-
-    # parses PAX headers in `testcontainers`' image-loading path. We only
-    # pull known images (`pgsty/minio`) by a pinned tag, never
-    # untrusted tarballs. Upgrade path: `testcontainers` switching to
-    # `astral-tokio-tar` or an equivalent maintained fork.
-    "RUSTSEC-2025-0111",
-    # RUSTSEC-2025-0134: `rustls-pemfile` is unmaintained (archived), pulled
-    # by `bollard` (Docker Engine API client) inside `testcontainers` — dev-
-    # only, since `crates/s3armor/src/tls.rs` was migrated to
-    # `rustls-pki-types`'s own `PemObject` API (`s3armor`'s direct dependency on
-    # `rustls-pemfile` is gone; only the dev-dependency path through
-    # `testcontainers` -> `bollard` remains). No safe upgrade exists yet
-    # upstream. Upgrade path: `bollard` moving to `PemObject` too.
-    "RUSTSEC-2025-0134",
-
     # The optional, off-by-default `pprof` feature (flamegraph
     # profiling, never in the release image) pulls `inferno` -> an old
     # `quick-xml 0.26.0`, flagged by the same two advisories already
