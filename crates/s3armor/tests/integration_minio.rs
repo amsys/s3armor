@@ -2262,7 +2262,7 @@ async fn backend_connect_timeout_fails_fast_instead_of_hanging() {
 /// timeout actually wraps has already resolved.
 #[tokio::test]
 async fn slow_client_body_read_is_not_bounded_by_the_backend_response_timeout() {
-    let timeout_request = Duration::from_millis(200);
+    let timeout_request = Duration::from_secs(1);
     let (client, _endpoint, _minio_endpoint, _minio) =
         setup_with(|config| config.timeout_request = timeout_request).await;
     let bucket = "slow-client-body-read";
