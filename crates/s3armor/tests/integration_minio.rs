@@ -1927,6 +1927,66 @@ async fn cors_preflight_is_answered_before_auth() {
     );
 }
 
+/// An unauthenticated `OPTIONS` request that declares a body must not
+/// reach the backend with that `Content-Length`. The proxy forwards an
+/// empty body. A backend that got `Content-Length: 300` and no bytes
+/// reads the next request on the pooled connection as the body. This
+/// test uses a stub backend, not `MinIO`, to read the forwarded head.
+#[tokio::test]
+async fn preflight_with_a_declared_body_reaches_the_backend_with_length_zero() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub backend");
+    let backend_addr = backend.local_addr().expect("stub backend address");
+    let head_task = tokio::spawn(async move {
+        let (mut sock, _) = backend.accept().await.expect("proxy connects");
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.expect("read request head");
+            assert!(n > 0, "proxy closed before the end of the head");
+            head.extend_from_slice(&buf[..n]);
+        }
+        sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .expect("write response");
+        String::from_utf8_lossy(&head).to_ascii_lowercase()
+    });
+
+    let (_client, endpoint) = spawn_proxy(&format!("http://{backend_addr}"), |_| {}).await;
+    let proxy_addr = endpoint
+        .strip_prefix("http://")
+        .expect("proxy endpoint is plain http");
+    let mut conn = TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
+    conn.write_all(
+        b"OPTIONS /bucket/key HTTP/1.1\r\nHost: proxy\r\nOrigin: https://example.test\r\n\
+          Content-Length: 300\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .expect("write preflight");
+
+    let head = tokio::time::timeout(Duration::from_secs(10), head_task)
+        .await
+        .expect("stub backend sees the request")
+        .expect("stub backend task");
+    assert!(
+        head.contains("\r\ncontent-length: 0\r\n"),
+        "backend must see a zero length, got: {head}"
+    );
+    assert!(
+        !head.contains("content-length: 300"),
+        "the client's length must not reach the backend, got: {head}"
+    );
+    assert!(
+        !head.contains("\r\nconnection: close"),
+        "hop-by-hop headers must not reach the backend, got: {head}"
+    );
+}
+
 /// The raw HTTP status of an `SdkError`'s underlying response, for
 /// asserting `304`/`412` — neither is a normal 2xx data response, so the
 /// SDK surfaces both as an `Err`, but the real status is still on the wire.

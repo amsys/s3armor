@@ -342,7 +342,11 @@ async fn handle_inner(
         // this is a CORS capability check, not a data path, so a heuristic
         // here doesn't create a security regression.
         let backend = preflight_backend(&state.config)?;
-        let outbound_headers = headers::to_pairs(req.headers());
+        // No signature covers these headers, so the strip rules apply
+        // immediately. An unauthenticated peer must not send hop-by-hop
+        // headers to the backend.
+        let mut outbound_headers = headers::to_pairs(req.headers());
+        headers::strip_for_backend(&mut outbound_headers);
         let backend_resp = forward(
             state,
             backend,
@@ -654,6 +658,12 @@ pub(crate) async fn forward(
         S3Error::bad_gateway("upstream endpoint is misconfigured".to_string())
     })?;
     set_header(&mut outbound_headers, "host", backend_authority.as_str());
+    // The client's `Content-Length` describes the client's body. Many paths
+    // forward an empty body in its place (the `OPTIONS` preflight, and the
+    // GET, HEAD and copy requests). See `headers::zero_content_length`.
+    if http_body::Body::is_end_stream(&outbound_body) {
+        headers::zero_content_length(&mut outbound_headers);
+    }
 
     let amz_date = sigv4::time::format_amz_date(SystemTime::now());
     set_header(&mut outbound_headers, "x-amz-date", &amz_date);

@@ -79,6 +79,21 @@ pub fn strip_for_backend(headers: &mut Vec<(String, String)>) {
     });
 }
 
+/// Sets a `Content-Length` header that is present to `0`. It adds no header.
+///
+/// Call this when the outbound body is empty. The HTTP client keeps a
+/// `Content-Length` that the caller set and writes no body bytes. A value
+/// above zero then makes the backend wait for bytes that never come, and
+/// the backend reads the next request on the pooled connection as that
+/// body.
+pub fn zero_content_length(headers: &mut [(String, String)]) {
+    for (name, value) in headers.iter_mut() {
+        if name.eq_ignore_ascii_case("content-length") {
+            "0".clone_into(value);
+        }
+    }
+}
+
 /// Removes only the `aws-chunked` token from a `Content-Encoding` value
 /// (which may be combined, e.g. `aws-chunked,gzip`), dropping the header
 /// entirely when nothing is left. Returns `None` when the header should be
@@ -198,6 +213,26 @@ mod tests {
         strip_for_backend(&mut headers);
         let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, vec!["x-amz-meta-app-id"]);
+    }
+
+    #[test]
+    fn zero_content_length_rewrites_a_present_header_and_adds_none() {
+        let mut headers = vec![
+            ("Content-Length".to_string(), "300".to_string()),
+            ("Origin".to_string(), "https://example.test".to_string()),
+        ];
+        zero_content_length(&mut headers);
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Length".to_string(), "0".to_string()),
+                ("Origin".to_string(), "https://example.test".to_string()),
+            ]
+        );
+
+        let mut none = vec![("Origin".to_string(), "https://example.test".to_string())];
+        zero_content_length(&mut none);
+        assert_eq!(none.len(), 1);
     }
 
     #[test]
