@@ -32,6 +32,17 @@ ignore = [
     # Sibling advisory: O(n^2) duplicate-attribute-name scan in
     # `BytesStart::attributes()` — not used (write-only).
     "RUSTSEC-2026-0194",
+
+    # The two entries below are "unmaintained" notices, not defects, and
+    # no replacement release exists. The two crates are in the test
+    # dependencies only. The shipped binary does not contain them.
+    #
+    # RUSTSEC-2026-0440: `astral-tokio-tar`, from `testcontainers`. Remove
+    # this entry when `testcontainers` moves to a different tar crate.
+    "RUSTSEC-2026-0440",
+    # RUSTSEC-2026-0441: `pin-utils`, from the `aws-smithy-*` crates of
+    # the AWS SDK test client. Remove this entry when the SDK drops it.
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]
