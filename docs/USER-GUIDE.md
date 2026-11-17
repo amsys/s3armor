@@ -18,14 +18,14 @@ image and one set of subcommands. There is no separate binary per tool.
 ### 1.1 Docker
 
 ```sh
-docker pull ghcr.io/amsys/s3armor:0.1
+docker pull ghcr.io/amsys/s3armor:0.3.0
 ```
 
 The image entrypoint is `s3armor`. The default command is `serve`. Run any
 other subcommand by naming it:
 
 ```sh
-docker run --rm ghcr.io/amsys/s3armor:0.1 check --bucket my-bucket
+docker run --rm ghcr.io/amsys/s3armor:0.3.0 check --bucket my-bucket
 ```
 
 A `-debug` build tag adds a profiling endpoint (see
@@ -53,7 +53,7 @@ docker run --rm \
   -e S3A_KEY_K1_FILE=/run/secrets/master.key \
   -p 8080:8080 \
   -p 9090:9090 \
-  ghcr.io/amsys/s3armor:0.1
+  ghcr.io/amsys/s3armor:0.3.0
 ```
 
 For Kubernetes, use this `securityContext`:
@@ -210,7 +210,7 @@ credentials from step 2.
 ```yaml
 services:
   s3armor:
-    image: ghcr.io/amsys/s3armor:0.1
+    image: ghcr.io/amsys/s3armor:0.3.0
     ports: ["8080:8080"]
     environment:
       S3A_BACKEND_ENDPOINT: https://fsn1.your-objectstorage.com

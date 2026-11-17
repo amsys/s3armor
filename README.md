@@ -52,7 +52,7 @@ your app  --S3-->  s3armor  --S3-->  storage
 
 ```sh
 # Install: container image, .deb, .apk or static binary.
-docker pull ghcr.io/amsys/s3armor:0.2.0
+docker pull ghcr.io/amsys/s3armor:0.3.0
 # Packages and binaries: https://github.com/amsys/s3armor/releases
 # From source: cargo build --release
 
